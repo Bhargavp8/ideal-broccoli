@@ -1,0 +1,3830 @@
+Option Compare Database
+Option Explicit
+
+'==============================================================================
+' modAnomalyAlert - Anomaly Surge/Drop Alert  (v22)
+'==============================================================================
+' Reads   : qry_ZPT_Combined (UNION of lnk_5610 + lnk_5650 - READ ONLY)
+'           lnk_PlanReceipts (linked table over Receipts Plan and Reported.xlsx
+'           - READ ONLY, same pattern as lnk_5610 / lnk_5650)
+' Writes  : tbl_ZPT_Local, tbl_Plan_Local, tbl_Config, tbl_AlertLog
+'           (all LOCAL to this .accdb)
+' Sends   : CDO via mailhub.utc.com:25 (no Outlook, no human)
+'
+' NOTHING here writes to the O: drive source files.
+'
+' FIRST RUN : RBDB_Setup()
+' TEST      : RBDB_Test()
+' PARITY    : RBDB_Parity()      <- prints the settings the dashboard depends on
+' SCHEDULED : RBDB_RunAlert()    <- AutoExec calls this, daily
+'
+'==============================================================================
+' ENGINE SECTION
+'==============================================================================
+'   Each plant section carries one extra table between the sales group summary
+'   and the detail panels: EVERY engine model in that plant that breached the
+'   threshold, highest anomaly first. No cap - if forty engines breach, forty
+'   rows are listed.
+'
+'   ENGINE ONLY. The key is [Eng Model] on its own, pooled across every sales
+'   group and every customer in the plant. That is the whole point of the
+'   section: an engine that is quiet inside an otherwise healthy sales group
+'   never surfaces at group grain, and is invisible in the panels unless its
+'   group was flagged first. Here it is judged on its own history.
+'
+'   Same column set and same colours as Summary by sales group, with the
+'   engine model as the label. No sales group column, no customer, no part
+'   type - one row per engine model.
+'
+'   MEMBERSHIP IS SurgeTest, exactly as at group and customer/part-type level.
+'   Nothing is listed for being merely large. RANKING IS SortRows/RankKey, so
+'   the order means what it means everywhere else: highest magnitude first
+'   under band mode (a surge and a drop of the same size rank together),
+'   SortBy under the percentage test.
+'
+'   ZERO-RECEIPT ROWS ARE NOT LISTED. An engine that received nothing sits at
+'   exactly -100%, or at the Z_EXTREME sentinel under band mode, so it
+'   breaches every time and cannot be ranked against another one. They are
+'   counted and the count is printed under the table, so they are excluded
+'   from the view without being hidden. Deliberately NOT gated on
+'   HideZeroReceipts - that flag governs the detail panels only.
+'
+'   NOT A SUBSET OF THE COUNTS ABOVE IT. These rows are not included in the
+'   "n sales group(s) breached / n customer / part type combination(s)
+'   breached" line - that count is at two other grains - and they do not sum
+'   to the summary table. A row's HWA is computed on its own history, and
+'   per-key HWAs at different grains do not add to the same plant total.
+'
+'   THE PLAN COLUMNS ARE INDICATIVE AT THIS GRAIN. totExpM is the plant total
+'   of the SALES-GROUP HWAs, so an engine-grain share of it does not sum to
+'   the plant plan. That is exactly what the customer / part-type panels
+'   already do - BuildGroupDetail passes the same totExpM down - so all three
+'   grains split the plan the same way. Making this section self-consistent
+'   instead would make it disagree with the panels, which is worse.
+'
+'==============================================================================
+' v22 - THE Z-SCORE IS NO LONGER PRINTED. NOTHING ELSE ABOUT IT CHANGED.
+'==============================================================================
+'   v21 put a sigma count in the vs-HWA column whenever SurgeTestMode = 2.
+'   That column now ALWAYS shows % CHG, in either mode, because a sigma count
+'   means nothing to most of the people who read this email.
+'
+'   THE TEST ITSELF IS COMPLETELY UNCHANGED. SurgeTest still decides which
+'   rows appear using the z-score, RankKey still orders them by it, and
+'   tRow.zScore is still populated on every flagged row. Only the rendering
+'   reverted. Setting SurgeTestMode back to 1 still switches the test, and
+'   every dollar figure is still identical in either mode.
+'
+'   WHAT REPLACED IT. A VERDICT column, rendered only under mode 2, saying in
+'   words where the row landed against its own normal range:
+'
+'     within normal range                    below the threshold
+'     just above / below normal range        1.0 to 1.5x the threshold
+'     clearly above / below normal range     1.5 to 2.0x
+'     far above / below normal range         beyond 2.0x
+'     far above / below anything seen before Z_EXTREME - no prior variation
+'     not enough history                     fewer than MIN_VOL_WEEKS weeks
+'
+'   The bands are multiples of SurgeThreshold rather than fixed sigma counts,
+'   so moving the threshold moves the wording with it and "just outside"
+'   always means just past wherever the line actually is.
+'
+'   WHY THIS MATTERS FOR THE READER. Without the sigma count on the page, two
+'   rows can show a similar % CHG and only one of them appear, with nothing
+'   in the row explaining why. The VERDICT column is what closes that gap,
+'   and the legend and the parameters block both describe the method in full.
+'   If the VERDICT column is ever removed, that gap comes back.
+'
+'   HOW THE METHOD IS DESCRIBED. In layman's terms throughout: the row's own
+'   recent range is split into six bands, the middle four count as normal and
+'   the outer two - one high, one low - are flagged. That is the same +-2
+'   sigma test as before, described without the word sigma. tbl_Config's
+'   Notes for SurgeTestMode say the same thing, so the config table itself
+'   explains the method to whoever inherits this.
+'
+'   NWEEKS NOW CLAMPS AT 12, not 10, matching the widened N Weeks slicer on
+'   the dashboard. Both sides must agree or the HWA and the volatility window
+'   differ silently.
+'
+'==============================================================================
+' v21 - VOLATILITY-BASED (Z-SCORE) SURGE TEST. OFF BY DEFAULT. READ THIS FIRST.
+'==============================================================================
+'   Up to v20 a row was flagged on Abs(pace) >= SurgeThreshold, where pace is
+'   the percent deviation from HWA. That treats a group that normally swings
+'   +-40% week to week the same as a group that is normally flat within 2%:
+'   the same threshold either drowns the first in false alarms or is too
+'   blunt to catch the second doing something genuinely unusual.
+'
+'   SurgeTestMode in tbl_Config switches WHICH TEST decides whether a row is
+'   flagged and how rows are ranked:
+'
+'     1 = percent deviation from HWA (default, unchanged from v20)
+'     2 = the row's own recent weekly range, split into six bands
+'
+'   Mode 2 asks a different question of the same numbers: not "how far is
+'   this from what was expected, as a percentage", but "how far is this from
+'   what THIS row's recent history says is normal, in units of that row's own
+'   noise". A volatile group has to move further in absolute percentage terms
+'   before it counts as unusual; a steady one gets flagged sooner.
+'
+'   NOTHING ELSE CHANGES. ACT, HWA, VAR ($), the Plan MML comparison and
+'   every dollar figure in the email are computed exactly as before, in
+'   either mode. Mode 2 only changes which rows clear the bar and what order
+'   they are ranked in. If it turns out to misbehave, setting SurgeTestMode
+'   back to 1 is a config change, not a code change, and every other figure
+'   in the email is completely unaffected either way.
+'
+'   THE THRESHOLD CHANGES UNITS WHEN THE MODE DOES. SurgeThreshold is read as
+'   a percentage (0.25 = 25%) under mode 1 and as a SIGMA MULTIPLIER (2.0 =
+'   2 standard deviations, i.e. the middle four of six bands) under mode 2.
+'   It is the same tbl_Config row either way - which means switching
+'   SurgeTestMode to 2 without ALSO updating SurgeThreshold leaves the old
+'   percentage value (typically 0.25) sitting there being read as a sigma
+'   count, which would flag almost every row in the database. LoadCfg clamps
+'   this defensively (see below), but the correct fix is to set both
+'   together. RBDB_Parity() checks for exactly this and says so if it finds it.
+'
+'   WHAT "VOLATILITY" MEANS HERE. For a given key (sales group, or customer /
+'   part type) and a given bucket, its trailing NWeeks weekly totals are
+'   pulled individually - not summed into one window the way the N-Week
+'   Basis HWA is, but kept as NWeeks separate numbers - and the sample
+'   standard deviation of those numbers is the volatility for that bucket.
+'   A month-to-date figure needs a month-to-date volatility: since the
+'   buckets are non-overlapping windows in time, their variances are summed
+'   and the total square-rooted (Var(A+B) = Var(A) + Var(B) for independent
+'   A, B), which is the same principle behind CM MTD Expected summing bucket
+'   expectations, applied to variance instead of mean.
+'
+'   MINIMUM SAMPLE SIZE. A standard deviation of one or two points is not a
+'   deviation, it is noise pretending to be a measurement. MIN_VOL_WEEKS (3)
+'   is the floor. If NWeeks is set below it while SurgeTestMode = 2, the run
+'   falls back to mode 1 automatically and ONCE, at the top of the run (see
+'   m_effTestMode below) - not row by row, which would let some rows in one
+'   email be judged one way and some another for no reason a reader could see.
+'
+'   THE ZERO-VOLATILITY KEY. A key whose last NWeeks weeks were identical -
+'   most often because they were all exactly zero - has no measured spread
+'   at all. Any real move away from that is not "some number of standard
+'   deviations", it is a break from a pattern that had never moved before,
+'   which is arguably the single most informative event this system can
+'   observe and the one a plain percentage view is worst at surfacing. Such
+'   a move is reported at the sentinel Z_EXTREME (correctly signed) rather
+'   than divided by zero or silently dropped. It is not a claim that the
+'   event was literally fifty standard deviations large - it is "further
+'   outside this key's known pattern than a number can usefully express."
+'   The reader sees this as "far above anything seen before".
+'
+'   RANKING FOLLOWS THE ACTIVE TEST. Up to v20, ranking always used the
+'   dollar VAR vs HWA "so the ordering means the same thing in every table."
+'   The same logic extends here: under mode 2, ranking uses the z-score,
+'   because that is now the thing deciding whether a row appears at all -
+'   ranking by dollar variance while flagging by the band test would produce
+'   a table whose own order didn't explain its own membership.
+'
+'   MIGRATING AN EXISTING DATABASE. tbl_Config keeps whatever it already has;
+'   SurgeTestMode defaults to 1 for both a fresh RBDB_Setup() and an existing
+'   database with no such row, so nothing changes until you explicitly ask
+'   for it. To switch on:
+'
+'     1. tbl_Config: SurgeTestMode -> 2
+'     2. tbl_Config: SurgeThreshold -> something in the 1.5-3.0 range. 2.0 is
+'        a reasonable start (the middle four of six bands, roughly the 95%
+'        two-tailed cutoff on a normal distribution - though receipts data is
+'        not normal, so treat it as a starting point to tune rather than a
+'        statistical guarantee).
+'     3. Confirm NWeeks >= 3 (it defaults to 4, so this is normally already
+'        true).
+'     4. Run RBDB_Parity() - it checks all three and says exactly what is
+'        still wrong, if anything.
+'
+'   THE DASHBOARD SIDE NEEDS THE SAME LOGIC, SEPARATELY. This module and the
+'   .pbix are two independent implementations of the same arithmetic, the way
+'   they were for HWA before v20. The DAX companions are CM Week Volatility
+'   (N-Week Basis), CM MTD Volatility and CM MTD Z-Score - see DAX EQUIVALENCE
+'   at the foot of this header block. Wherever the dashboard currently filters
+'   or highlights rows using the percentage test, that filter needs to move to
+'   whichever measure now decides flagging, or the two will disagree exactly
+'   the way they did before v20's parity work - this feature is new enough
+'   that it has not been through that reconciliation yet, and should not be
+'   assumed to already tie out.
+'
+'==============================================================================
+' v20 - POWER BI PARITY. READ THIS BEFORE CHANGING ANY SETTING.
+'==============================================================================
+'   v20 changes nothing about how the arithmetic works. It changes three
+'   DEFAULTS and one FILTERING RULE so that the figures in this email are the
+'   same figures the dashboard shows for the same sales group in the same
+'   window. Up to v19 they were not, and the difference was invisible: both
+'   sides were internally consistent and neither said what it was measuring.
+'
+'   The HWA core was already correct. The recency-weighted monthly baseline,
+'   the trailing weekly average, the blend between them and the /4 that makes
+'   the monthly figure a per-week one all match the DAX exactly, term for
+'   term. Nothing in that path was touched.
+'
+'   WHAT CHANGED, AND WHY EACH ONE MATTERED
+'
+'   1. PaceMode  1 -> 2
+'      Was: one completed week in isolation. The dashboard has always been
+'      month-to-date. Same group, same period, week 3: this email could say
+'      +40% for that week alone while the dashboard said -5% for weeks 1-3
+'      together. Both right, neither reconcilable, and no way for a reader
+'      holding one of them to know the other existed. Mode 2 is what the
+'      equivalence table below has always claimed - ActMap(..., mode:=2).
+'
+'      SIDE EFFECT: the email is now cumulative, so the same underlying week
+'      influences four consecutive emails with decreasing leverage. A single
+'      bad week no longer disappears from view the following week. If a
+'      genuine single-week read is wanted alongside this, that is a second
+'      email, not a mode switch.
+'
+'   2. ProratePlan  0 -> 1
+'      Was: month-to-date actual against the FULL month plan, so every row
+'      read negative until the last week of the month and the plan columns
+'      were effectively unreadable for three weeks in four. The old Notes
+'      called 0 "Power BI parity", and it was - but with the MONTH-BY-MONTH
+'      measure, not the one on the front page. The top of the dashboard
+'      prorates. 1 matches it.
+'
+'   3. HideZeroReceipts now applies to DETAIL PANELS ONLY
+'      Was: applied in three places at once, and two of them were wrong.
+'
+'        a) THE PLAN DENOMINATOR. The totExpM loop skipped zero-actual rows,
+'           so the plant total this email divided by was smaller than the one
+'           REMOVEFILTERS gives the DAX measure. That did not just hide the
+'           suppressed rows - it shifted EVERY plan share in the email, on
+'           every row, including the ones that were reported. The single
+'           worst parity break in the module and the hardest to spot, because
+'           the numbers looked entirely plausible.
+'
+'        b) SALES GROUP SELECTION. A group whose receipts stopped completely
+'           was dropped BEFORE the threshold test, so the loudest signal the
+'           system can observe was the one thing that never generated an
+'           email. The dashboard showed it at -100% the whole time.
+'
+'      Both now ignore the flag. Detail panels still honour it: a column of
+'      identical -100% part types cannot be ranked and says nothing beyond
+'      what the group line already said.
+'
+'   4. A group with no receipts at all now renders a specific panel note
+'      rather than the generic "no single part type breached", which read as
+'      reassurance in exactly the case that warrants the least.
+'
+'   NOT CHANGED, DELIBERATELY
+'      MinExpected and DollarFloor stay at 0. Both are email-side noise
+'      filters with no dashboard equivalent - the dashboard shows every row
+'      and lets the reader scan. Raising either is a legitimate tuning
+'      decision; just know that it makes the email a strict subset of the
+'      dashboard rather than a different view of it.
+'
+'   RBDB_Parity() prints every setting the dashboard depends on and flags the
+'   ones that are off. Run it after any change to tbl_Config, and run it
+'   first whenever someone reports that the email and the dashboard disagree.
+'
+'==============================================================================
+' WHAT THE DASHBOARD MUST DO FOR ITS HALF
+'==============================================================================
+'   Parity is a two-sided contract and this module can only hold up one side.
+'   The .pbix must also:
+'
+'   - Anchor on TODAY(), not on the latest receipt date. The DAX measures
+'     _Due Week and _Due Eval Date mirror DueWeek() / DueEvalDate() below.
+'     Without them the dashboard freezes on a stale window when the O: drive
+'     workbook stops refreshing, and - unlike this email - says nothing.
+'
+'   - Filter the page to ONE PLANT, and lock the filter. Every figure here is
+'     computed inside a single plant. The DAX measures do not reference plant
+'     at all, so with the filter cleared the plan denominator spans both and
+'     every share is wrong.
+'
+'   - Scope the plan table by month AND plant. A bare SUM over Planned
+'     Receipts compares one month of actuals against the entire plan file.
+'
+'   - Match the slicer defaults to tbl_Config: SeasonalWeight 0.4, NMonths 6,
+'     NWeeks 4. These are slicers on the dashboard and fixed settings here, so
+'     they agree only if the defaults agree - and a reader who moves a slicer
+'     mid-conversation moves the dashboard away from this email without
+'     either side flagging it.
+'
+'   - Clamp the N Weeks slicer to 1..12, as LoadCfg does (v22 - was 1..10).
+'     Zero blanks the entire HWA through DIVIDE.
+'
+'   - Use Rcvd Date rather than the Calendar relationship in the N-Month
+'     basis, as the N-Week basis already does. Rows with a null or
+'     out-of-range Rcvd Date otherwise count in one basis and not the other,
+'     and in neither here.
+'
+'==============================================================================
+' TWO METHODOLOGICAL NOTES - TRUE OF BOTH SYSTEMS
+'==============================================================================
+'   Neither is a parity break. Both will eventually be asked about.
+'
+'   THE TWO HALVES OF THE HWA TREAT ABSENCE DIFFERENTLY. The monthly basis
+'   drops zero months from numerator and denominator both, which raises the
+'   average. The weekly basis divides by all N weeks whether or not they had
+'   receipts, which lowers it. For an intermittent part type the two halves
+'   pull in opposite directions, and SeasonalWeight silently decides which
+'   bias wins. If a lumpy sales group reads persistently high, this is why.
+'
+'   THE N-WEEK WINDOW REACHES INTO THE MONTH BEING JUDGED. Bucket 3's window
+'   starts 28 days before day 15, so it contains days 1-14 of the current
+'   month. A surge in week 1 therefore raises the expected for week 3 and
+'   damps detection of a surge that is still running. Arguably intended -
+'   it is what makes the measure responsive - but it means the HWA is not
+'   independent of the period it is judging.
+'
+'==============================================================================
+' WHEN IT SENDS (v19)
+'   v19 split the CLOCK from the DATA. Up to v18 the trigger hung off the
+'   data: RefDateGlobal() read the latest RcvdDate and CMWeeksComplete()
+'   derived the due week from it, so a workbook that stopped refreshing on the
+'   19th meant the 22nd came and went and week 3 never became due. Nothing
+'   sent, and nothing said so.
+'
+'     THE CLOCK   DueWeek() / DueEvalDate(), read off Date(). One email at the
+'                 start of each bucket, reporting the bucket that just closed:
+'
+'                    day 1-7   -> week 4 of the PREVIOUS month
+'                    day 8-14  -> week 1 of this month
+'                    day 15-21 -> week 2
+'                    day 22+   -> week 3
+'
+'     THE DATA    RefDateGlobal() still anchors the baseline maths and still
+'                 stamps "source data as at" on the email. It no longer
+'                 decides whether anything sends.
+'
+'   CATCH-UP. The scheduler fires daily, and tbl_AlertLog is the once-only
+'   guard (EvalYM + EvalWeek + Sent=True). A bucket that was missed - box off,
+'   Access crashed, run errored - is still unsent in the log, so the next
+'   daily run picks it up. If more than one bucket went by unsent, every one
+'   of them is logged as superseded and ONLY THE NEWEST IS EMAILED, because
+'   four catch-up emails arriving together get deleted unread.
+'
+'   STALE DATA. Triggering off the calendar means the run can fire against a
+'   workbook nobody refreshed, and an empty window reads as every group at
+'   -100% - a false alarm that looks catastrophic. So before sending, the
+'   staged data has to reach the end of the window being reported:
+'
+'     DataLagGraceDays (default 3) - the last days of a bucket genuinely have
+'       no receipts sometimes, so data is also accepted as current if its
+'       latest date is within this many days of TODAY.
+'
+'     MaxDeferDays (default 3) - the backstop. Inside this, the run defers and
+'       tomorrow's scheduled run tries again. Past it, the email goes anyway
+'       with an amber banner naming the date the data actually reaches. It
+'       never silently withholds, and it never silently lies.
+'
+'   NOTHING-TO-REPORT WEEKS log Sent=True with "no groups flagged" in Detail,
+'   so a clean bucket closes rather than re-evaluating on every daily run. To
+'   go back to daily retry, change the one LogRun call in EvaluateAndSend
+'   where nTotal = 0 from True to False.
+'
+'   TriggerMode in tbl_Config switches the whole thing:
+'     1 = calendar (default, the above)
+'     2 = the v18 data-driven behaviour, unchanged
+'   A config change rather than a code change, so it rolls back without
+'   opening the VBA editor. NOTE: mode 2 also breaks parity with the dashboard
+'   once the dashboard is on _Due Week, so it is a diagnostic setting now.
+'
+' VOCABULARY (v18) - READ THIS IF YOU MAINTAIN THE CODE
+'   Two words the reader sees changed in v18. The arithmetic did not:
+'
+'     EXP  ->  HWA        "historical weighted average". The recency-weighted
+'                         blend of the N-month baseline and the trailing
+'                         N-week average.
+'     GAP  ->  VAR        ACT minus HWA, in dollars.
+'
+'   The CODE still says exp / Expected / gap, deliberately - renaming
+'   identifiers would touch every dictionary, every helper signature and the
+'   tRow definition for no behavioural gain, and "Exp" is also a VBA builtin,
+'   so a blanket rename is a live hazard. Read the mapping as:
+'
+'     tRow.exp, dExp, ExpMap, ExpectedMap, planExp, MinExpected  ->  HWA
+'     tRow.gap, netGap, planGap, qGap, DollarFloor               ->  VAR
+'
+'   tbl_Config PARAM NAMES ARE ALSO UNCHANGED. Renaming them would orphan the
+'   settings in every existing copy of the database. Only Notes text was
+'   reworded, and Notes are only rewritten if RBDB_Setup() is run again.
+'
+' UNITS (v18)
+'   Every block of columns states its unit in the band above it: ($) for
+'   receipts value, (units) for quantity. The legend repeats the unit against
+'   each abbreviation.
+'
+' PANEL LABELS (v18)
+'   Panel rows stack customer above part type, which makes the column only as
+'   wide as the LONGER of the two rather than the sum. That buys the customer
+'   30 characters instead of 12 without widening the panel.
+'
+' NAME CHANGE (v17)
+'   Everything the reader sees says "Anomaly" rather than "RBDB". The three
+'   PUBLIC ENTRY POINTS deliberately keep their old names, because Task
+'   Scheduler and the AutoExec macro call them by name - rename them and the
+'   scheduled run silently stops firing. MAIL_FROM also keeps its old address:
+'   that mailbox is registered with the relay, and changing it needs IT.
+'
+' REQUIRED REFERENCE
+'   Tools > References > Microsoft Office xx.x Access Database Engine Object
+'   Library. Without it, "Dim db As DAO.Database" will not compile.
+'
+' REQUIRED SOURCE CHANGE (v15)
+'   qry_ZPT_Combined must expose a Plant column:
+'
+'     SELECT '5610' AS Plant, [Sales Grp], [Cust Name], [Part Type Desc],
+'            [Eng Model], [Rcvd Date], [Adjusted Value], [Qty Rcvd]
+'     FROM lnk_5610
+'     UNION ALL
+'     SELECT '5650' AS Plant, ... FROM lnk_5650;
+'
+' REQUIRED SOURCE CHANGE (v16)
+'   A linked table named lnk_PlanReceipts must exist, pointing at Sheet1 of
+'   Receipts Plan and Reported.xlsx, with columns Site, Month, Planned
+'   Receipts, Reported Receipts.
+'
+' NAMING WARNING
+'   Never declare a variable called nZ. VBA is case-insensitive and the editor
+'   auto-capitalises identifiers, so a local nZ silently rewrites every Nz()
+'   call in the module into nZ() and the project stops compiling.
+'
+' SQL EXPRESSION WARNING
+'   Key expressions passed to AggMap are interpolated straight into a SELECT
+'   and a GROUP BY. Keep them to column names, the & operator and string
+'   literals. A function the query engine cannot resolve there fails the whole
+'   run with "the expression you entered has a function name that Microsoft
+'   Access can't find" - and so does a project that will not compile, because
+'   Access can then no longer resolve PlanNum() in RefreshPlan either. If that
+'   message appears, run Debug > Compile first.
+'
+' PLANT SPLIT
+'   5610 = PWCS, 5650 = CAS. PWCS is always rendered first. Every figure -
+'   actual, HWA, planned, ranking, thresholds - is computed inside a single
+'   plant. Nothing is pooled across plants; the engine section pools sales
+'   groups WITHIN one plant only. A plant with nothing flagged still gets its
+'   heading and a one-line note. If neither plant flags anything, no email.
+'
+' PERFORMANCE
+'   All aggregates come from bulk GROUP BY queries into dictionaries. The
+'   monthly-basis and weekly-basis maps are memoised for the duration of a run
+'   (m_mbCache / m_wbCache). The engine section adds four aggregates per plant
+'   at engine-model grain, which is a small key set - far smaller than the
+'   customer / part-type maps the panels already build.
+'==============================================================================
+'
+' DAX EQUIVALENCE
+'   Measure names below are the real names in the .pbix and are quoted
+'   verbatim - they still say Expected and Gap.
+'
+'   _Due Week                        -> DueWeek()
+'   _Due Eval Date                   -> DueEvalDate()
+'   _Ref Date                        -> RefDateGlobal()   [display only now]
+'   _CM Anchor                       -> CMAnchor()
+'   _CM Start / _CM End              -> CMStart() / CMEnd()
+'   _CM Cutoff                       -> WindowEnd()
+'   CM Weeks Complete                -> CMWeeksComplete()
+'   Calendar[MonthWeek]              -> MonthWeekOf()
+'   CM MTD Actual                    -> ActMap(..., mode:=2)
+'   CM MTD Expected                  -> ExpMap(..., mode:=2)      [HWA]
+'   CM Bucket Actual                 -> ActualMap(..., mode:=1)
+'   CM Week Expected (N-Month Basis) -> MonthBasisMap()           [HWA]
+'   CM Week Expected (N-Week Basis)  -> WeekBasisMap()            [HWA]
+'   CM Bucket Expected               -> (1-w)*base + w*recent     [HWA]
+'   CM Full Month Expected           -> (no direct equivalent; see PlanTotal)
+'   CM Gap (MTD Act - Exp)           -> tRow.gap  (mode 2)        [VAR]
+'   CM Plan Month Total              -> PlanTotal()
+'   MTD Planned Receipts ... EST     -> tRow.planExp
+'   CM Gap (MTD Act - Planned)       -> tRow.planGap              [VAR]
+'   Data Lag Days / Currency Note    -> DataLagState() / DataWarnTxt()
+'   CM Week Volatility (N-Week Basis)-> WeekVolatilityMap()            [v21]
+'   CM MTD Volatility                -> MTDVolatilityMap()             [v21]
+'   CM MTD Z-Score                   -> tRow.zScore (m_effTestMode=2)  [v21]
+'   CM Z Interpretation              -> VerdictTxt()                   [v22]
+'   SurgeTestMode                    -> m_cfg.testMode / m_effTestMode [v21]
+'                                        (no DAX equivalent unless the .pbix
+'                                        also implements a mode toggle - see
+'                                        the v21 header block above)
+'   Summary by engine model          -> BuildEngineSectionHtml()
+'                                        (no DAX equivalent - engine model is
+'                                        an email-only grain.)
+'
+'   NOT equivalent, despite similar names: Exp_Base and Exp_Recent in the
+'   .pbix belong to the month-by-month section and weight prior CALENDAR
+'   YEARS, not the last N months. They are a different baseline family and
+'   nothing in this module corresponds to them.
+'==============================================================================
+
+Private Const SMTP_SERVER As String = "mailhub.utc.com"
+Private Const SMTP_PORT   As Long = 25
+
+' Registered with the relay under this address. Changing it needs IT.
+Private Const MAIL_FROM   As String = "RBDB_Anomaly_Alert@prattwhitney.com"
+
+Private Const SRC_QUERY   As String = "qry_ZPT_Combined"
+Private Const LOCAL_TBL   As String = "tbl_ZPT_Local"
+
+' Planned receipts. Read through a linked table, same as lnk_5610 / lnk_5650.
+' The hint constants are only used in the error message if the link is missing.
+Private Const SRC_PLAN_LINK       As String = "lnk_PlanReceipts"
+Private Const SRC_PLAN_PATH_HINT  As String = _
+    "O:\Finance\Common\Receipts & Backlog Automation\PBI\Receipts Plan and Reported.xlsx"
+Private Const SRC_PLAN_SHEET_HINT As String = "Sheet1"
+Private Const PLAN_TBL            As String = "tbl_Plan_Local"
+
+' The link at the top of every email.
+'
+' PARITY / HANDOVER NOTE: this points at a .pbix file. After the Report Server
+' migration that URL downloads a multi-hundred-MB file that only opens in
+' Power BI Desktop, rather than opening the report. Replace it with the Report
+' Server report URL before handover.
+Private Const REPORT_URL  As String = "https://rtxusers.sharepoint.us/:u:/r/sites/PWCSMaterialsandPurchasing-PW/Shared%20Documents/General/RBDB/RBDB%20Dashboard%20(With%20Surge%20Analysis)%20updated.pbix?d=w1a4261f88ea0474296cb41a871cc463b&csf=1&web=1&e=1RFX8c"
+
+' What the report is called in front of the reader.
+Private Const APP_NAME    As String = "Receipts Anomaly Detection"
+
+' The two measures. Everything is computed once for each.
+Private Const FLD_VALUE   As String = "AdjValue"
+Private Const FLD_QTY     As String = "QtyRcvd"
+
+' The unit each block of columns is expressed in.
+Private Const UNIT_VALUE  As String = "$"
+Private Const UNIT_QTY    As String = "units"
+
+' How many group panels sit side by side. Panels carry eight columns, so 2 is
+' the practical maximum.
+Private Const PANELS_PER_ROW As Long = 2
+
+' Longest sales group label rendered before it is clipped with an ellipsis.
+Private Const MAX_GRP_LABEL  As Long = 40
+
+' Panel rows are "customer / part type", and the two STACK - customer above,
+' part type below. The column is as wide as the LONGER of the two, not the
+' sum. Raise either freely up to about 34; past that the panel grid needs a
+' horizontal scroll in the Outlook reading pane at PANELS_PER_ROW = 2.
+Private Const MAX_CUST_LABEL As Long = 30
+Private Const MAX_PART_LABEL As Long = 32
+Private Const MAX_ITEM_LABEL As Long = 46   ' fallback when there is no " / "
+
+' Engine model label in the engine section. Its own constant, NOT
+' MAX_PART_LABEL: [Eng Model] and [Part Type Desc] are different fields, and
+' widening the panels for a long part type should not rewrap this table.
+Private Const MAX_ENG_LABEL  As Long = 32
+
+' Width of the legend box. The only table in the email that carries a width:
+' everything else self-sizes to its figures, but this one is a paragraph.
+Private Const LEGEND_WIDTH   As Long = 760
+
+' Palette. HWA columns blue, plan columns teal, quantity columns grey.
+Private Const C_TITLE     As String = "#1F497D"   ' group / plant title bar
+Private Const C_BAND      As String = "#365F91"   ' vs HWA band
+Private Const C_HEAD      As String = "#4F81BD"   ' vs HWA column header
+Private Const C_BAND_P    As String = "#31859C"   ' vs PLAN band
+Private Const C_HEAD_P    As String = "#4BACC6"   ' vs PLAN column header
+Private Const C_BAND_Q    As String = "#595959"   ' QTY band
+Private Const C_HEAD_Q    As String = "#808080"   ' QTY column header
+Private Const C_ROW_A     As String = "#DCE6F1"   ' summary stripe A
+Private Const C_ROW_B     As String = "#EFF3F8"   ' summary stripe B
+Private Const C_MUTED     As String = "#808080"
+Private Const C_BORDER    As String = "#B8CCE4"
+Private Const C_ALERT     As String = "#9C0006"   ' zero-receipt callout
+
+' Sentinel used wherever a percentage cannot exist because its denominator
+' was zero. Rendered as a dash.
+Private Const NO_PCT      As Double = 9999
+
+' v21. Sentinel z-score for a key whose recent history has zero measured
+' volatility but which moved anyway - not a literal 50-sigma claim, see the
+' v21 header block. MIN_VOL_WEEKS is the minimum sample a standard deviation
+' needs before it means anything; below it, z-score mode falls back to the
+' percentage test for the whole run (see m_effTestMode).
+Private Const Z_EXTREME    As Double = 50
+Private Const MIN_VOL_WEEKS As Long = 3
+
+' v22. Multiples of SurgeThreshold at which the VERDICT wording steps up.
+' Deliberately relative rather than absolute sigma counts, so moving the
+' threshold moves the wording with it.
+Private Const VERDICT_CLEAR As Double = 1.5
+Private Const VERDICT_FAR   As Double = 2#
+
+Private m_db As DAO.Database
+Private m_mbCache As Object
+Private m_wbCache As Object
+
+' One reported line. Every "q" member is the qty twin of the receipts member
+' above it. Every "plan" member is the month-to-date comparison against the
+' plan share.
+'
+' The exp / gap member names are the code's names for what the email calls
+' HWA and VAR. See VOCABULARY at the top.
+Private Type tRow
+    Label    As String
+    pace     As Double         ' receipts % change vs HWA
+    act      As Double         ' actual receipts value ($), PaceMode window
+    exp      As Double         ' HWA receipts value ($), PaceMode window
+    gap      As Double         ' VAR ($): act - exp
+    qPace    As Double         ' qty % change vs HWA
+    qAct     As Double         ' actual qty received (units)
+    qExp     As Double         ' HWA qty (units)
+    qGap     As Double         ' VAR (units): qAct - qExp
+    planAct  As Double         ' month-to-date actual receipts value ($)
+    planExp  As Double         ' this row's share of the plant month plan ($)
+    planGap  As Double         ' VAR ($): planAct - planExp
+    planPace As Double         ' planGap / planExp
+    nSub     As Long           ' part types that breached the threshold
+    nZero    As Long           ' part types that received nothing (not shown)
+    zScore   As Double         ' v21: distance from the row's own recent range.
+                               ' NO_PCT when SurgeTestMode = 1 (not computed).
+                               ' v22: still computed, no longer printed.
+End Type
+
+' Settings and run state, loaded once per evaluation. Held at module level so
+' the twenty-odd helpers below do not each need a fifteen-argument signature.
+Private Type tCfg
+    thr         As Double
+    nMonths     As Long
+    nWeeks      As Long
+    seasW       As Double
+    mode        As Long
+    minExp      As Double
+    dollarFloor As Double
+    maxGrp      As Long
+    topDrv      As Long
+    sortBy      As Long
+    prorate     As Long
+    hideZero    As Long
+    trigMode    As Long
+    lagGrace    As Long
+    maxDefer    As Long
+    testMode    As Long          ' v21: 1 = percent vs HWA, 2 = band test
+    trimVol     As Long          ' v21: 1 = drop the most extreme week first
+End Type
+
+Private m_cfg      As tCfg
+Private m_evalDate As Date
+Private m_refCap   As Date
+Private m_weeks    As Long
+
+' Set when the run goes ahead on data that does not reach the end of the
+' window. Empty on a normal run; when populated it becomes the amber banner at
+' the top of the email and a suffix on the subject line.
+Private m_dataWarn As String
+
+' v21. The test actually used THIS RUN, decided once in LoadCfg rather than
+' per row - see the v21 header block for why a per-row decision would be
+' worse. Every row-selection and ranking call reads this, never m_cfg.testMode
+' directly.
+Private m_effTestMode As Long
+Private m_thrWasClamped As Boolean   ' v21: true if LoadCfg had to override a leftover percentage-style SurgeThreshold
+
+
+'==============================================================================
+' PLANTS - order here is the order in the email. PWCS first.
+'==============================================================================
+Private Function PlantCount() As Long
+    PlantCount = 2
+End Function
+
+Private Function PlantCode(i As Long) As String
+    If i = 0 Then PlantCode = "5610" Else PlantCode = "5650"
+End Function
+
+Private Function PlantName(i As Long) As String
+    If i = 0 Then PlantName = "PWCS" Else PlantName = "CAS"
+End Function
+
+
+'==============================================================================
+' Cached database handle. CurrentDb() builds a fresh Database object on every
+' call, which is needless churn at this query volume.
+'==============================================================================
+Private Function GetDb() As DAO.Database
+    If m_db Is Nothing Then Set m_db = CurrentDb()
+    Set GetDb = m_db
+End Function
+
+Private Sub ClearCaches()
+    Set m_mbCache = Nothing
+    Set m_wbCache = Nothing
+End Sub
+
+
+'==============================================================================
+' SETUP
+'   PARAM NAMES ARE FIXED. Renaming MinExpected or DollarFloor would orphan
+'   the settings in every copy of this database that already has a tbl_Config.
+'
+'   v20 changes three DEFAULTS. An existing database keeps whatever is already
+'   in its tbl_Config - these values only apply on a fresh RBDB_Setup(). Run
+'   RBDB_Parity() on an existing database to see which need updating by hand.
+'
+'   NOTES TEXT IS CAPPED AT 255 CHARACTERS by the column definition below.
+'   Anything longer truncates silently on insert. Check any new or edited
+'   Notes string against that limit before shipping.
+'==============================================================================
+Public Function RBDB_Setup()
+
+    Dim db As DAO.Database
+    Set db = CurrentDb()
+
+    DropTableSafe db, "tbl_Config"
+    DropTableSafe db, "tbl_AlertLog"
+
+    db.Execute "CREATE TABLE tbl_Config (" & _
+               "ParamName TEXT(50), ParamValue DOUBLE, Notes TEXT(255))", dbFailOnError
+
+    AddCfg db, "SurgeThreshold", 0.25, "Deviation from HWA that triggers an alert. 0.25 = 25 percent under SurgeTestMode 1. Under SurgeTestMode 2 it is a band width instead - 2.0 keeps the middle four of six bands as normal. Set it to 2.0 when switching modes"
+    AddCfg db, "SurgeTestMode", 1, "1 = percent deviation from HWA (default). 2 = bell curve: each row's own recent weekly range split into six bands, middle four normal, outer two flagged as surge or drop. Needs NWeeks >= 3; set SurgeThreshold to 2.0"
+    AddCfg db, "NMonths", 6, "Months of history for the HWA baseline average. MUST match the N Months slicer default in the .pbix"
+    AddCfg db, "NWeeks", 4, "Trailing weeks for the recent basis of the HWA, and for the range in SurgeTestMode 2 (max 12). MUST match the N Weeks slicer default in the .pbix"
+    AddCfg db, "SeasonalWeight", 0.4, "0 = all N-month basis, 1 = all N-week basis. MUST match the Seasonal Weight slicer default in the .pbix"
+    AddCfg db, "PaceMode", 2, "2 = cumulative weeks 1..N, month-to-date - matches the dashboard (default). 1 = single completed week in isolation, which the dashboard has no equivalent of"
+    AddCfg db, "MinExpected", 0, "Suppress rows whose HWA is below this. 0 = dashboard parity; above 0 makes the email a subset of the dashboard"
+    AddCfg db, "DollarFloor", 0, "Suppress rows whose VAR vs HWA is smaller than this in absolute dollars, however large the percentage. 0 = dashboard parity"
+    AddCfg db, "MaxGroupsDetailed", 0, "How many sales groups get a detail panel, per plant. 0 = every flagged group"
+    AddCfg db, "SortBy", 1, "Ranking basis everywhere: 1 = VAR, i.e. ACT - HWA in dollars (default), 2 = percent change"
+    AddCfg db, "TopDriversPerGroup", 5, "Max part type rows listed inside each panel"
+    AddCfg db, "ProratePlan", 1, "1 = scale plan by weeks complete / 4, matching the dashboard front page (default). 0 = MTD actual vs FULL month plan, which matches the month-by-month measure only"
+    AddCfg db, "HideZeroReceipts", 1, "1 = omit 0-receipt customer/part-type rows from DETAIL PANELS only (default). Never affects sales group selection or the plan denominator - both would break dashboard parity"
+    AddCfg db, "TriggerMode", 1, "1 = send on the first day of each bucket (1st, 8th, 15th, 22nd), catching up if a run was missed. 2 = v18 behaviour, due week derived from the latest receipt date - diagnostic only, breaks parity with the dashboard clock"
+    AddCfg db, "DataLagGraceDays", 3, "Accept the data as current if its latest date is within this many days of today, even if it stops short of the window end"
+    AddCfg db, "MaxDeferDays", 3, "How many days to keep deferring a due email while waiting for the source workbook to refresh. Past this it sends anyway, with a banner naming the date the data reaches"
+    AddCfg db, "VolatilityTrimOutlier", 0, "0 = off, raw N-week window (default). 1 = on, excludes the single most extreme week before measuring the range, so one unusual week cannot widen it. Falls back to 0 if NWeeks-1 < 3. Only used when SurgeTestMode = 2"
+
+    ' Recipients live in the Notes column. ParamValue is unused here.
+    ' Separate multiple addresses with semicolons.
+    '
+    ' HANDOVER NOTE: add at least one colleague and a shared mailbox before
+    ' December. SendAlert falls back to a single named address if this row is
+    ' empty, and LogRun records the send as successful either way - so on the
+    ' day that account is deprovisioned the alert stops arriving and the log
+    ' keeps saying it was sent.
+    AddCfg db, "Recipients", 0, "Bhargav.Prashanth@prattwhitney.com"
+
+    db.Execute "CREATE TABLE tbl_AlertLog (" & _
+               "LogID AUTOINCREMENT PRIMARY KEY, RunDate DATETIME, " & _
+               "EvalYM LONG, EvalWeek LONG, RefDate DATETIME, " & _
+               "GroupsFlagged LONG, Sent YESNO, Detail MEMO)", dbFailOnError
+
+    RefreshLocal
+    LoadCfg          ' SeedLog needs TriggerMode to know which weeks to seed
+    SeedLog
+
+    MsgBox "Setup complete." & vbCrLf & vbCrLf & _
+           "tbl_Config created - thresholds and caps are edited there." & vbCrLf & _
+           "tbl_ZPT_Local staged with " & Format(DCount("*", LOCAL_TBL), "#,##0") & " rows " & vbCrLf & _
+           "  PWCS 5610: " & Format(DCount("*", LOCAL_TBL, "PlantCd='5610'"), "#,##0") & vbCrLf & _
+           "  CAS  5650: " & Format(DCount("*", LOCAL_TBL, "PlantCd='5650'"), "#,##0") & vbCrLf & _
+           "  unmatched: " & Format(DCount("*", LOCAL_TBL, "PlantCd<>'5610' AND PlantCd<>'5650'"), "#,##0") & vbCrLf & vbCrLf & _
+           PLAN_TBL & " staged with " & Format(DCount("*", PLAN_TBL), "#,##0") & " plan rows." & vbCrLf & vbCrLf & _
+           "Weeks up to the current one marked as already reported, so no " & vbCrLf & _
+           "backlog of emails goes out. Reporting starts from the next week." & vbCrLf & vbCrLf & _
+           "Next: run RBDB_Parity(), then RBDB_Test()", vbInformation
+
+End Function
+
+
+'------------------------------------------------------------------------------
+' Mark every week up to and including the current one as already reported,
+' without sending anything.
+'------------------------------------------------------------------------------
+Private Sub SeedLog()
+
+    Dim db As DAO.Database
+    Dim cmRef As Date, prevRef As Date
+    Dim w As Long, weeksDone As Long
+
+    Set db = GetDb()
+
+    cmRef = DueEvalDate()
+    weeksDone = DueWeek()
+    prevRef = MonthStart(cmRef) - 1
+
+    For w = 1 To 4
+        db.Execute "INSERT INTO tbl_AlertLog (RunDate, EvalYM, EvalWeek, RefDate, " & _
+                   "GroupsFlagged, Sent, Detail) VALUES (Now(), " & YMOf(prevRef) & ", " & w & _
+                   ", " & SqlDate(prevRef) & ", 0, True, 'seeded at setup - not sent')", dbFailOnError
+    Next w
+
+    For w = 1 To weeksDone
+        db.Execute "INSERT INTO tbl_AlertLog (RunDate, EvalYM, EvalWeek, RefDate, " & _
+                   "GroupsFlagged, Sent, Detail) VALUES (Now(), " & YMOf(cmRef) & ", " & w & _
+                   ", " & SqlDate(cmRef) & ", 0, True, 'seeded at setup - not sent')", dbFailOnError
+    Next w
+
+End Sub
+
+
+Private Sub AddCfg(db As DAO.Database, sName As String, dVal As Double, sNote As String)
+    db.Execute "INSERT INTO tbl_Config (ParamName, ParamValue, Notes) VALUES ('" & _
+               sName & "', " & Dec(dVal) & ", '" & Replace(sNote, "'", "''") & "')", dbFailOnError
+End Sub
+
+
+'==============================================================================
+' PARITY CHECK (v20)
+'   Prints every setting the dashboard depends on and flags the ones that
+'   would make this email disagree with it. Run after any tbl_Config edit,
+'   and run FIRST whenever someone reports a discrepancy - it is faster than
+'   reconciling two numbers by hand and it is usually the answer.
+'
+'   Safe to run any time. Reads only; sends nothing; logs nothing.
+'==============================================================================
+Public Sub RBDB_Parity()
+
+    Dim s As String
+    Dim nBad As Long
+    Dim nBlankGrp As Long, nOrphan As Long
+
+    LoadCfg
+
+    s = "PARITY CHECK - " & Format(Now(), "dd mmm yyyy hh:nn") & vbCrLf & String(58, "-") & vbCrLf
+
+    '--- the four that break the numbers --------------------------------------
+    s = s & ChkLine("PaceMode", m_cfg.mode, 2, _
+            "1 = single week; the dashboard is month-to-date", nBad)
+
+    s = s & ChkLine("ProratePlan", m_cfg.prorate, 1, _
+            "0 compares MTD actual against a FULL month plan", nBad)
+
+    s = s & ChkLine("NMonths", m_cfg.nMonths, 6, _
+            "must equal the N Months slicer default in the .pbix", nBad)
+
+    s = s & ChkLine("NWeeks", m_cfg.nWeeks, 4, _
+            "must equal the N Weeks slicer default in the .pbix", nBad)
+
+    '--- seasonal weight is a Double, checked separately -----------------------
+    If Abs(m_cfg.seasW - 0.4) > 0.0001 Then
+        s = s & "  [X] SeasonalWeight   = " & Format(m_cfg.seasW, "0.00") & _
+                "   expected 0.40" & vbCrLf & _
+                "      must equal the Seasonal Weight slicer default in the .pbix" & vbCrLf
+        nBad = nBad + 1
+    Else
+        s = s & "  [ok] SeasonalWeight  = " & Format(m_cfg.seasW, "0.00") & vbCrLf
+    End If
+
+    '--- the clock -------------------------------------------------------------
+    s = s & ChkLine("TriggerMode", m_cfg.trigMode, 1, _
+            "2 anchors on the data, not the calendar - diagnostic only", nBad)
+
+    '--- v21/v22: the surge test itself -----------------------------------------
+    ' Not a dashboard-parity check like the ones above - the dollar figures
+    ' (ACT, HWA, VAR, Plan MML) are identical regardless of this setting.
+    ' This section only checks that the test is internally consistent.
+    s = s & vbCrLf & "Surge test:" & vbCrLf
+    s = s & "  SurgeTestMode  = " & m_cfg.testMode & _
+            IIf(m_cfg.testMode = 2, "  (bell curve, six bands)", "  (percent vs HWA)") & vbCrLf
+
+    If m_cfg.testMode = 2 And m_cfg.nWeeks < MIN_VOL_WEEKS Then
+        s = s & "  [X] NWeeks (" & m_cfg.nWeeks & ") is below the minimum (" & _
+                MIN_VOL_WEEKS & ") a range needs to be measurable. This run FELL" & vbCrLf & _
+                "      BACK to percent-vs-HWA. Raise NWeeks, or set SurgeTestMode back" & vbCrLf & _
+                "      to 1 to stop this being reported as a fallback." & vbCrLf
+        nBad = nBad + 1
+    End If
+
+    If m_thrWasClamped Then
+        s = s & "  [X] SurgeThreshold looked like a leftover percentage (below 0.5) for" & vbCrLf & _
+                "      band mode - LoadCfg used 2.0 instead so nothing floods the" & vbCrLf & _
+                "      inbox, but tbl_Config still needs updating by hand to something" & vbCrLf & _
+                "      in the 1.5-3.0 range." & vbCrLf
+        nBad = nBad + 1
+    End If
+
+    If m_effTestMode = 2 Then
+        s = s & "  [ok] Effective this run: BELL CURVE, middle " & _
+                Format(m_cfg.thr * 2, "0.0") & " of 6 bands treated as normal," & vbCrLf & _
+                "       range measured over " & m_cfg.nWeeks & " trailing weeks" & vbCrLf
+    Else
+        s = s & "  [ok] Effective this run: PERCENT vs HWA, threshold " & _
+                Format(m_cfg.thr, "0.0%") & vbCrLf
+    End If
+
+    '--- v21: the outlier trim --------------------------------------------------
+    s = s & vbCrLf & "Range trim:" & vbCrLf
+    s = s & "  VolatilityTrimOutlier = " & m_cfg.trimVol & _
+            IIf(m_cfg.trimVol = 1, "  (on)", "  (off, default)") & vbCrLf
+
+    If m_cfg.trimVol = 1 And (m_cfg.nWeeks - 1) < MIN_VOL_WEEKS Then
+        s = s & "  [X] NWeeks (" & m_cfg.nWeeks & ") minus 1 is below the minimum (" & _
+                MIN_VOL_WEEKS & ") needed to trim and still measure a range. This" & vbCrLf & _
+                "      run did NOT trim. Raise NWeeks, or leave trim off." & vbCrLf
+        nBad = nBad + 1
+    ElseIf m_cfg.trimVol = 1 Then
+        s = s & "  [ok] Trimming active: each row's single most extreme week (of " & _
+                m_cfg.nWeeks & ")" & vbCrLf & _
+                "       is excluded before its normal range is measured." & vbCrLf
+    End If
+
+    '--- the two that narrow rather than distort -------------------------------
+    s = s & vbCrLf & "Noise filters (0 = show everything, as the dashboard does):" & vbCrLf
+    s = s & "  MinExpected   = " & Format(m_cfg.minExp, "#,##0") & _
+            IIf(m_cfg.minExp > 0, "   <- email is a SUBSET of the dashboard", "") & vbCrLf
+    s = s & "  DollarFloor   = " & Format(m_cfg.dollarFloor, "#,##0") & _
+            IIf(m_cfg.dollarFloor > 0, "   <- email is a SUBSET of the dashboard", "") & vbCrLf
+    s = s & "  HideZeroReceipts = " & m_cfg.hideZero & _
+            "   (detail panels only - never the denominator)" & vbCrLf
+
+    '--- data-side checks ------------------------------------------------------
+    s = s & vbCrLf & "Data:" & vbCrLf
+
+    If TableExists(GetDb(), LOCAL_TBL) Then
+        nBlankGrp = Nz(DCount("*", LOCAL_TBL, "SalesGrp Is Null OR Trim(SalesGrp)=''"), 0)
+        nOrphan = Nz(DCount("*", LOCAL_TBL, "RcvdDate Is Null"), 0)
+
+        s = s & "  rows staged        " & Format(DCount("*", LOCAL_TBL), "#,##0") & vbCrLf
+        s = s & "  blank Sales Grp    " & Format(nBlankGrp, "#,##0")
+        If nBlankGrp > 0 Then
+            s = s & "   <- MISMATCH: dropped here, shown on the dashboard"
+            nBad = nBad + 1
+        End If
+        s = s & vbCrLf
+
+        s = s & "  null Rcvd Date     " & Format(nOrphan, "#,##0")
+        If nOrphan > 0 Then
+            s = s & "   <- excluded here; check the .pbix does the same"
+            nBad = nBad + 1
+        End If
+        s = s & vbCrLf
+
+        s = s & "  data reaches       " & Format(RefDateGlobal(), "dd mmm yyyy") & vbCrLf
+    Else
+        s = s & "  " & LOCAL_TBL & " not staged - run RBDB_Test() first" & vbCrLf
+    End If
+
+    '--- the window this run would report --------------------------------------
+    m_evalDate = DueEvalDate()
+    m_weeks = DueWeek()
+
+    s = s & vbCrLf & "Window this run would report:" & vbCrLf
+    s = s & "  " & Format(m_evalDate, "mmmm yyyy") & ", " & WeekSpanLabel() & vbCrLf
+    s = s & "  " & WindowRangeTxt() & vbCrLf
+    s = s & "  lag state " & DataLagState(m_evalDate, m_weeks) & _
+            "  (0 = send, 1 = defer, 2 = send with banner)" & vbCrLf
+
+    s = s & String(58, "-") & vbCrLf
+    If nBad = 0 Then
+        s = s & "All parity settings match. Figures should tie to the dashboard" & vbCrLf & _
+                "provided the .pbix is filtered to ONE PLANT and its plan table" & vbCrLf & _
+                "is scoped by month and plant."
+    Else
+        s = s & nBad & " setting(s) would make this email disagree with the" & vbCrLf & _
+                "dashboard. Fix them in tbl_Config and run this again."
+    End If
+
+    Debug.Print s
+    MsgBox s, IIf(nBad = 0, vbInformation, vbExclamation), APP_NAME & " - parity check"
+
+End Sub
+
+
+'------------------------------------------------------------------------------
+' One line of the parity report for a Long setting.
+'------------------------------------------------------------------------------
+Private Function ChkLine(sName As String, lActual As Long, lWant As Long, _
+                         sWhy As String, ByRef nBad As Long) As String
+
+    Dim sPad As String
+
+    sPad = sName & String(16, " ")
+    sPad = Left(sPad, 16)
+
+    If lActual = lWant Then
+        ChkLine = "  [ok] " & sPad & " = " & lActual & vbCrLf
+    Else
+        ChkLine = "  [X]  " & sPad & " = " & lActual & "   expected " & lWant & vbCrLf & _
+                  "      " & sWhy & vbCrLf
+        nBad = nBad + 1
+    End If
+
+End Function
+
+
+'==============================================================================
+' LOCAL STAGING
+'   Two staged tables, both rebuilt on every run. Source files are only read.
+'==============================================================================
+Private Sub RefreshLocal()
+
+    Dim db As DAO.Database
+
+    Set m_db = Nothing               ' DDL below invalidates cached TableDefs
+    ClearCaches
+    Set db = CurrentDb()
+
+    If Not HasPlantField(db) Then
+        Err.Raise vbObjectError + 513, "RefreshLocal", _
+            SRC_QUERY & " has no [Plant] column." & vbCrLf & vbCrLf & _
+            "Add one to each leg of the union so the two plants can be reported " & _
+            "separately, e.g. SELECT '5610' AS Plant, ... FROM lnk_5610 UNION ALL " & _
+            "SELECT '5650' AS Plant, ... FROM lnk_5650;"
+    End If
+
+    DropTableSafe db, LOCAL_TBL
+
+    db.Execute "SELECT Trim(CStr(Nz([Plant], ''))) AS PlantCd, " & _
+               "[Sales Grp] AS SalesGrp, [Cust Name] AS CustName, " & _
+               "[Part Type Desc] AS PartType, [Eng Model] AS EngModel, " & _
+               "[Rcvd Date] AS RcvdDate, [Adjusted Value] AS AdjValue, " & _
+               "Nz([Qty Rcvd], 0) AS QtyRcvd " & _
+               "INTO " & LOCAL_TBL & " FROM " & SRC_QUERY & ";", dbFailOnError
+
+    On Error Resume Next
+    db.Execute "CREATE INDEX idxDate ON " & LOCAL_TBL & " (RcvdDate)"
+    db.Execute "CREATE INDEX idxGrp ON " & LOCAL_TBL & " (SalesGrp)"
+    db.Execute "CREATE INDEX idxPlantDate ON " & LOCAL_TBL & " (PlantCd, RcvdDate)"
+    db.Execute "CREATE INDEX idxPlantGrpDate ON " & LOCAL_TBL & " (PlantCd, SalesGrp, RcvdDate)"
+    On Error GoTo 0
+
+    RefreshPlan db
+
+    Set m_db = Nothing               ' force re-acquire against the new tables
+
+End Sub
+
+
+'------------------------------------------------------------------------------
+' Drop a staged table and make sure it is actually gone.
+'
+' A bare "On Error Resume Next / DROP TABLE" hides the one failure that
+' matters: Access cannot drop a table that is open in Datasheet or Design
+' view, so the drop fails silently and the SELECT INTO that follows dies with
+' the confusing "table already exists".
+'------------------------------------------------------------------------------
+Private Sub DropTableSafe(db As DAO.Database, sName As String)
+
+    If Not TableExists(db, sName) Then Exit Sub
+
+    On Error Resume Next
+    DoCmd.Close acTable, sName, acSaveNo
+    Err.Clear
+
+    db.Execute "DROP TABLE " & sName
+    Err.Clear
+    On Error GoTo 0
+
+    db.TableDefs.Refresh
+
+    If TableExists(db, sName) Then
+        Err.Raise vbObjectError + 515, "DropTableSafe", _
+            "Could not drop " & sName & " before rebuilding it." & vbCrLf & vbCrLf & _
+            "It is almost certainly still open somewhere - close it in " & _
+            "Datasheet or Design view (and any query or form bound to it), " & _
+            "then run this again."
+    End If
+
+End Sub
+
+
+'------------------------------------------------------------------------------
+' Does the source expose a plant discriminator? Cheapest reliable check is to
+' ask for one row of it and see whether the engine objects.
+'------------------------------------------------------------------------------
+Private Function HasPlantField(db As DAO.Database) As Boolean
+
+    Dim rs As DAO.Recordset
+
+    On Error GoTo NoField
+    Set rs = db.OpenRecordset("SELECT TOP 1 [Plant] FROM " & SRC_QUERY, dbOpenSnapshot)
+    rs.Close
+    HasPlantField = True
+    Exit Function
+
+NoField:
+    HasPlantField = False
+End Function
+
+
+'------------------------------------------------------------------------------
+' Does a table (local or linked) with this name exist in the current database?
+'------------------------------------------------------------------------------
+Private Function TableExists(db As DAO.Database, sName As String) As Boolean
+
+    Dim td As DAO.TableDef
+
+    On Error Resume Next
+    Set td = db.TableDefs(sName)
+    On Error GoTo 0
+
+    TableExists = Not (td Is Nothing)
+End Function
+
+
+'------------------------------------------------------------------------------
+' Safe numeric parse for cells that may have arrived as text. Called from SQL
+' below, so it must stay Public: Access's query engine can invoke a Public
+' function in a standard module as if it were a builtin, but not a Private one.
+'------------------------------------------------------------------------------
+Public Function PlanNum(v As Variant) As Double
+    If IsNull(v) Then
+        PlanNum = 0
+    ElseIf IsNumeric(v) Then
+        PlanNum = CDbl(v)
+    Else
+        PlanNum = Val(Replace(Trim(CStr(v)), ",", ""))
+    End If
+End Function
+
+
+'------------------------------------------------------------------------------
+' Planned receipts, read from the linked table lnk_PlanReceipts.
+'
+' Site is matched on PWCS first and CAS second. Anything matching neither is
+' staged as 'Unknown' and never joins a plant section - it is not silently
+' folded into one of them.
+'
+' PARITY NOTE: the CDate([Month]) here is doing real work - the workbook
+' column arrives as text or as a serial. The DAX side must type that column as
+' Date in Power Query, or its own month comparison will run alphabetically and
+' "10/2026" will sort before "2/2026".
+'------------------------------------------------------------------------------
+Private Sub RefreshPlan(db As DAO.Database)
+
+    If Not TableExists(db, SRC_PLAN_LINK) Then
+        Err.Raise vbObjectError + 514, "RefreshPlan", _
+            "Linked table '" & SRC_PLAN_LINK & "' not found." & vbCrLf & vbCrLf & _
+            "Relink it via External Data > Linked Table Manager, pointing at:" & vbCrLf & _
+            SRC_PLAN_PATH_HINT & vbCrLf & "sheet " & SRC_PLAN_SHEET_HINT
+    End If
+
+    DropTableSafe db, PLAN_TBL
+
+    db.Execute "SELECT [Site], CDate([Month]) AS PlanMonth, " & _
+               "PlanNum([Planned Receipts]) AS PlannedRcpt, " & _
+               "PlanNum([Reported Receipts]) AS ReportedRcpt, " & _
+               "IIf(InStr(1, [Site], 'PWCS') > 0, '5610', " & _
+               "IIf(InStr(1, [Site], 'CAS') > 0, '5650', 'Unknown')) AS PlantCd " & _
+               "INTO " & PLAN_TBL & " FROM " & SRC_PLAN_LINK & _
+               " WHERE [Site] Is Not Null AND [Month] Is Not Null;", dbFailOnError
+
+    On Error Resume Next
+    db.Execute "CREATE INDEX idxPlan ON " & PLAN_TBL & " (PlantCd, PlanMonth)"
+    On Error GoTo 0
+
+End Sub
+
+
+Private Function Cfg(sName As String, dDefault As Double) As Double
+    Dim v As Variant
+    v = DLookup("ParamValue", "tbl_Config", "ParamName='" & sName & "'")
+    If IsNull(v) Then Cfg = dDefault Else Cfg = CDbl(v)
+End Function
+
+
+Private Sub LoadCfg()
+    With m_cfg
+        .thr = Cfg("SurgeThreshold", 0.25)
+        .nMonths = CLng(Cfg("NMonths", 6))
+        .nWeeks = CLng(Cfg("NWeeks", 4))
+        .seasW = Cfg("SeasonalWeight", 0.4)
+
+        ' v20: defaults to 2 (month-to-date), matching the dashboard. A
+        ' database created before v20 keeps whatever is in its tbl_Config -
+        ' RBDB_Parity() will flag it.
+        .mode = CLng(Cfg("PaceMode", 2))
+
+        .minExp = Cfg("MinExpected", 0)
+        .dollarFloor = Cfg("DollarFloor", 0)
+        .maxGrp = CLng(Cfg("MaxGroupsDetailed", 0))
+        .topDrv = CLng(Cfg("TopDriversPerGroup", 5))
+        .sortBy = CLng(Cfg("SortBy", 1))
+
+        ' v20: defaults to 1 (prorated), matching the dashboard front page.
+        .prorate = CLng(Cfg("ProratePlan", 1))
+
+        .hideZero = CLng(Cfg("HideZeroReceipts", 1))
+        .trigMode = CLng(Cfg("TriggerMode", 1))
+        .lagGrace = CLng(Cfg("DataLagGraceDays", 3))
+        .maxDefer = CLng(Cfg("MaxDeferDays", 3))
+        .testMode = CLng(Cfg("SurgeTestMode", 1))     ' v21: 1 is the safe fallback
+
+        .trimVol = CLng(Cfg("VolatilityTrimOutlier", 0))
+        If .trimVol <> 1 Then .trimVol = 0
+
+        ' v22: was 10. Must match the N Weeks slicer range in the .pbix.
+        If .nWeeks > 12 Then .nWeeks = 12
+        If .nWeeks < 1 Then .nWeeks = 1
+        If .nMonths < 1 Then .nMonths = 1
+        If .sortBy <> 1 Then .sortBy = 2
+        If .mode <> 1 Then .mode = 2          ' v20: 2 is now the fallback
+        If .prorate <> 0 Then .prorate = 1    ' v20: 1 is now the fallback
+        If .dollarFloor < 0 Then .dollarFloor = Abs(.dollarFloor)
+
+        If .trigMode <> 2 Then .trigMode = 1
+        If .lagGrace < 0 Then .lagGrace = 0
+        If .maxDefer < 0 Then .maxDefer = 0
+
+        If .testMode <> 2 Then .testMode = 1
+
+        ' A leftover percentage-style value (0.25) read as a band width would
+        ' flag almost every row in the database. This is a safety net, not a
+        ' substitute for updating tbl_Config properly - RBDB_Parity() calls
+        ' this out explicitly so it does not go unnoticed.
+        m_thrWasClamped = False
+        If .testMode = 2 And .thr < 0.5 Then
+            .thr = 2#
+            m_thrWasClamped = True
+        End If
+
+        ' The one place this run's effective test is decided. Every row
+        ' selection and every ranking call reads m_effTestMode, never
+        ' .testMode directly, so a single run is never a mix of both tests.
+        If .testMode = 2 And .nWeeks >= MIN_VOL_WEEKS Then
+            m_effTestMode = 2
+        Else
+            m_effTestMode = 1
+        End If
+    End With
+End Sub
+
+
+'==============================================================================
+' DATE HELPERS
+'==============================================================================
+Private Function MonthWeekOf(d As Date) As Long
+    Select Case Day(d)
+        Case Is <= 7:  MonthWeekOf = 1
+        Case Is <= 14: MonthWeekOf = 2
+        Case Is <= 21: MonthWeekOf = 3
+        Case Else:     MonthWeekOf = 4
+    End Select
+End Function
+
+Private Function MonthStart(d As Date) As Date
+    MonthStart = DateSerial(Year(d), Month(d), 1)
+End Function
+
+Private Function MonthEnd(d As Date) As Date
+    MonthEnd = DateSerial(Year(d), Month(d) + 1, 0)
+End Function
+
+Private Function BucketStart(d As Date, b As Long) As Date
+    BucketStart = DateSerial(Year(d), Month(d), (b - 1) * 7 + 1)
+End Function
+
+Private Function BucketEnd(d As Date, b As Long) As Date
+    If b >= 4 Then
+        BucketEnd = MonthEnd(d)
+    Else
+        BucketEnd = DateSerial(Year(d), Month(d), b * 7)
+    End If
+End Function
+
+' The last date the reported figures actually cover. This is the DAX _CM Cutoff.
+Private Function WindowEnd(evalDate As Date, weeksDone As Long) As Date
+    WindowEnd = BucketEnd(evalDate, weeksDone)
+End Function
+
+'------------------------------------------------------------------------------
+' The first date the reported figures actually cover. PaceMode 2 (the default
+' since v20) is cumulative from the month start, matching CM MTD Actual.
+'------------------------------------------------------------------------------
+Private Function WindowStart(evalDate As Date, weeksDone As Long) As Date
+    If m_cfg.mode = 1 Then
+        WindowStart = BucketStart(evalDate, weeksDone)
+    Else
+        WindowStart = MonthStart(evalDate)
+    End If
+End Function
+
+'------------------------------------------------------------------------------
+' How the window is described in words. Grows with the month on PaceMode 2:
+'   "week 1", "weeks 1 to 2", "weeks 1 to 3", "weeks 1 to 4"
+'------------------------------------------------------------------------------
+Private Function WeekSpanLabel() As String
+    If m_cfg.mode = 2 And m_weeks > 1 Then
+        WeekSpanLabel = "weeks 1 to " & m_weeks
+    Else
+        WeekSpanLabel = "week " & m_weeks
+    End If
+End Function
+
+' The same window as a date range, e.g. "01 Jul to 21 Jul 2026".
+Private Function WindowRangeTxt() As String
+    WindowRangeTxt = Format(WindowStart(m_evalDate, m_weeks), "dd mmm") & " to " & _
+                     Format(WindowEnd(m_evalDate, m_weeks), "dd mmm yyyy")
+End Function
+
+Private Function SqlDate(d As Date) As String
+    SqlDate = "#" & Format(d, "mm/dd/yyyy") & "#"
+End Function
+
+Private Function Esc(s As Variant) As String
+    If IsNull(s) Then Esc = "" Else Esc = Replace(CStr(s), "'", "''")
+End Function
+
+Private Function HtmlEsc(s As String) As String
+    HtmlEsc = Replace(Replace(Replace(s, "&", "&amp;"), "<", "&lt;"), ">", "&gt;")
+End Function
+
+Private Function YMOf(d As Date) As Long
+    YMOf = Year(d) * 100 + Month(d)
+End Function
+
+' Locale-safe decimal for anything interpolated into SQL or a log string.
+Private Function Dec(v As Double) As String
+    Dec = Replace(CStr(v), ",", ".")
+End Function
+
+
+'==============================================================================
+' ANCHOR CHAIN
+'   Deliberately global, i.e. across both plants. One reporting window for the
+'   whole email, so PWCS and CAS are always describing the same days.
+'==============================================================================
+Private Function RefDateGlobal() As Date
+    Dim v As Variant
+    If Nz(DCount("*", LOCAL_TBL, "RcvdDate = " & SqlDate(Date)), 0) > 0 Then
+        RefDateGlobal = Date
+    Else
+        v = DMax("RcvdDate", LOCAL_TBL)
+        If IsNull(v) Then RefDateGlobal = Date Else RefDateGlobal = CDate(v)
+    End If
+End Function
+
+Private Function CMAnchor() As Date
+    Dim vRef As Date
+    vRef = RefDateGlobal()
+    If MonthWeekOf(vRef) = 1 Then
+        CMAnchor = MonthStart(vRef) - 1
+    Else
+        CMAnchor = vRef
+    End If
+End Function
+
+Private Function CMStart() As Date
+    CMStart = MonthStart(CMAnchor())
+End Function
+
+Private Function CMEnd() As Date
+    CMEnd = MonthEnd(CMAnchor())
+End Function
+
+Private Function CMRefDate() As Date
+    Dim vStart As Date, vCap As Date, v As Variant
+    vStart = CMStart()
+    vCap = CMEnd()
+    If vCap > Date Then vCap = Date
+
+    v = DMax("RcvdDate", LOCAL_TBL, _
+             "RcvdDate >= " & SqlDate(vStart) & " AND RcvdDate <= " & SqlDate(vCap))
+    If IsNull(v) Then CMRefDate = vStart Else CMRefDate = CDate(v)
+End Function
+
+Private Function CMWeeksComplete() As Long
+    Dim b As Long
+    b = MonthWeekOf(RefDateGlobal())
+    If b = 1 Then CMWeeksComplete = 4 Else CMWeeksComplete = b - 1
+End Function
+
+
+'==============================================================================
+' THE CLOCK (v19)
+'   Which bucket is due to be reported TODAY, read off the calendar rather
+'   than off the data. A stalled workbook can no longer stop a bucket from
+'   becoming due, it can only defer the send (see DataLagState).
+'
+'   The DAX measures _Due Week and _Due Eval Date mirror these two exactly.
+'   Both honour TriggerMode = 2 by falling back to the v18 anchor chain.
+'==============================================================================
+'------------------------------------------------------------------------------
+' The bucket that closed most recently. Days 1-7 report week 4 of the previous
+' month; after that, the bucket before the one we are standing in.
+'------------------------------------------------------------------------------
+Private Function DueWeek() As Long
+
+    If m_cfg.trigMode = 2 Then
+        DueWeek = CMWeeksComplete()
+        Exit Function
+    End If
+
+    Select Case Day(Date)
+        Case Is <= 7:  DueWeek = 4
+        Case Is <= 14: DueWeek = 1
+        Case Is <= 21: DueWeek = 2
+        Case Else:     DueWeek = 3
+    End Select
+End Function
+
+'------------------------------------------------------------------------------
+' The month that bucket belongs to, expressed as a date inside it. On days 1-7
+' that is the previous month, since the bucket being reported is its week 4.
+'------------------------------------------------------------------------------
+Private Function DueEvalDate() As Date
+
+    If m_cfg.trigMode = 2 Then
+        DueEvalDate = CMRefDate()
+        Exit Function
+    End If
+
+    If Day(Date) <= 7 Then
+        DueEvalDate = MonthStart(Date) - 1        ' last day of the previous month
+    Else
+        DueEvalDate = Date
+    End If
+End Function
+
+
+'==============================================================================
+' STALE DATA GUARD (v19)
+'   0 = data reaches the window, send normally
+'   1 = data is short and we are still inside MaxDeferDays, defer to tomorrow
+'   2 = data is short and we are past MaxDeferDays, send with a banner
+'
+'   The grace test is deliberately against TODAY rather than against the
+'   window end: a bucket whose last few days were a quiet weekend legitimately
+'   has no receipts in it, and deferring for that would hold up a perfectly
+'   good email.
+'==============================================================================
+Private Function DataLagState(evalDate As Date, weeksDone As Long) As Long
+
+    Dim latest As Date, winEnd As Date
+
+    latest = RefDateGlobal()
+    winEnd = WindowEnd(evalDate, weeksDone)
+
+    If latest >= winEnd Then
+        DataLagState = 0
+    ElseIf DateDiff("d", latest, Date) <= m_cfg.lagGrace Then
+        DataLagState = 0
+    ElseIf DateDiff("d", winEnd, Date) > m_cfg.maxDefer Then
+        DataLagState = 2
+    Else
+        DataLagState = 1
+    End If
+End Function
+
+'------------------------------------------------------------------------------
+' The banner text for a state 2 send. Says what is missing and what it does to
+' the figures, because a reader who is not told will read a data gap as a
+' collapse in receipts.
+'------------------------------------------------------------------------------
+Private Function DataWarnTxt(evalDate As Date, weeksDone As Long) As String
+
+    Dim latest As Date, winEnd As Date
+
+    latest = RefDateGlobal()
+    winEnd = WindowEnd(evalDate, weeksDone)
+
+    DataWarnTxt = "The staged receipts data only reaches <b>" & _
+        Format(latest, "dd mmm yyyy") & "</b>, but this report covers up to <b>" & _
+        Format(winEnd, "dd mmm yyyy") & "</b>. The last " & _
+        DateDiff("d", latest, winEnd) & " day(s) of the window are missing, so " & _
+        "actuals are understated and a drop shown below may be data that has not " & _
+        "arrived rather than receipts that did not happen. Refresh the source " & _
+        "workbook and the next run will report the window in full."
+End Function
+
+
+'==============================================================================
+' BULK AGGREGATION
+'   Returns a Dictionary of key -> SUM(sField) for one date window.
+'   sKeyExpr is the SELECT/GROUP BY expression that forms the key.
+'   sWhereExtra always carries at least the plant filter.
+'
+'   KEY EXPRESSIONS ARE RAW SQL. Column names, the & operator and string
+'   literals only - see the SQL EXPRESSION WARNING at the top of the module.
+'
+'   PARITY NOTE: blank and whitespace-only keys are dropped. The DAX has no
+'   equivalent rule, so a blank Sales Grp would appear on the dashboard and
+'   in its plan denominator but not here. RBDB_Parity() counts them; if the
+'   count is 0 there is no divergence, and if it is not, fix it in the source
+'   rather than here.
+'==============================================================================
+Private Function AggMap(sField As String, sKeyExpr As String, sWhereExtra As String, _
+                        dFrom As Date, dTo As Date, bExclusiveTo As Boolean) As Object
+
+    Dim db As DAO.Database
+    Dim rs As DAO.Recordset
+    Dim d As Object
+    Dim sSql As String, sCmp As String
+
+    Set d = CreateObject("Scripting.Dictionary")
+    d.CompareMode = 1                        ' text, case-insensitive
+
+    If dTo < dFrom Then
+        Set AggMap = d
+        Exit Function
+    End If
+
+    If bExclusiveTo Then sCmp = "<" Else sCmp = "<="
+
+    sSql = "SELECT " & sKeyExpr & " AS K, SUM(" & sField & ") AS V FROM " & LOCAL_TBL & _
+           " WHERE RcvdDate >= " & SqlDate(dFrom) & " AND RcvdDate " & sCmp & " " & SqlDate(dTo)
+
+    If Len(sWhereExtra) > 0 Then sSql = sSql & " AND " & sWhereExtra
+
+    sSql = sSql & " GROUP BY " & sKeyExpr
+
+    Set db = GetDb()
+    Set rs = db.OpenRecordset(sSql, dbOpenSnapshot)
+
+    Do While Not rs.EOF
+        If Not IsNull(rs!k) Then
+            If Len(Trim(CStr(rs!k))) > 0 Then
+                If IsNull(rs!v) Then d(CStr(rs!k)) = 0 Else d(CStr(rs!k)) = rs!v
+            End If
+        End If
+        rs.MoveNext
+    Loop
+    rs.Close
+
+    Set AggMap = d
+End Function
+
+
+'------------------------------------------------------------------------------
+' Recency-weighted monthly baseline, per key, divided by 4. Half of the HWA.
+'
+' Mirrors CM Week Expected (N-Month Basis) exactly. Verified term by term:
+' for an August anchor with nMonths 6, July carries weight 6 here and
+' DATEDIFF(Jul 1, Aug 1, MONTH) = 1 -> 6 + 1 - 1 = 6 there. February carries
+' weight 1 on both sides. The "> 0 months only" rule and the /4 match too.
+'
+' The /4 makes this a PER-WEEK figure. ExpectedMap multiplies it back by
+' nBuckets, and the DAX SUMX over buckets does the same - so neither side
+' double-counts, but a change to one without the other would.
+'
+' Memoised: PaceMode 1 needs both a single-week HWA and a month-to-date HWA
+' for the plan ratio, and this baseline is identical for both. Callers only
+' read the returned dictionary, never mutate it.
+'------------------------------------------------------------------------------
+Private Function MonthBasisMap(sField As String, sKeyExpr As String, sWhereExtra As String, _
+                               evalDate As Date, nMonths As Long) As Object
+
+    Dim dSumWT As Object, dSumW As Object, dOut As Object, dMonth As Object
+    Dim i As Long, w As Double
+    Dim mStart As Date, mEnd As Date, anchor As Date
+    Dim k As Variant
+    Dim sKey As String
+
+    sKey = sField & "|" & sKeyExpr & "|" & sWhereExtra & "|" & _
+           CLng(CDbl(evalDate)) & "|" & nMonths
+
+    If m_mbCache Is Nothing Then
+        Set m_mbCache = CreateObject("Scripting.Dictionary")
+        m_mbCache.CompareMode = 1
+    End If
+
+    If m_mbCache.Exists(sKey) Then
+        Set MonthBasisMap = m_mbCache(sKey)
+        Exit Function
+    End If
+
+    Set dSumWT = CreateObject("Scripting.Dictionary"): dSumWT.CompareMode = 1
+    Set dSumW = CreateObject("Scripting.Dictionary"):  dSumW.CompareMode = 1
+    Set dOut = CreateObject("Scripting.Dictionary"):   dOut.CompareMode = 1
+
+    anchor = MonthStart(evalDate)
+
+    For i = 1 To nMonths
+        mStart = DateAdd("m", -i, anchor)
+        mEnd = DateSerial(Year(mStart), Month(mStart) + 1, 0)
+        w = nMonths + 1 - i
+
+        Set dMonth = AggMap(sField, sKeyExpr, sWhereExtra, mStart, mEnd, False)
+
+        For Each k In dMonth.Keys
+            If dMonth(k) > 0 Then
+                If dSumWT.Exists(k) Then
+                    dSumWT(k) = dSumWT(k) + dMonth(k) * w
+                    dSumW(k) = dSumW(k) + w
+                Else
+                    dSumWT(k) = dMonth(k) * w
+                    dSumW(k) = w
+                End If
+            End If
+        Next k
+    Next i
+
+    For Each k In dSumW.Keys
+        If dSumW(k) > 0 Then dOut(k) = (dSumWT(k) / dSumW(k)) / 4
+    Next k
+
+    m_mbCache.Add sKey, dOut
+    Set MonthBasisMap = dOut
+End Function
+
+
+'------------------------------------------------------------------------------
+' Trailing N-week average for one bucket, per key. The other half of the HWA.
+' Mirrors CM Week Expected (N-Week Basis): same bucket start, same -nWeeks*7
+' window, same exclusive upper bound, same divide by nWeeks. Memoised for the
+' same reason as above.
+'------------------------------------------------------------------------------
+Private Function WeekBasisMap(sField As String, sKeyExpr As String, sWhereExtra As String, _
+                              evalDate As Date, b As Long, nWeeks As Long) As Object
+
+    Dim bStart As Date, winStart As Date
+    Dim dRaw As Object, dOut As Object
+    Dim k As Variant
+    Dim sKey As String
+
+    sKey = sField & "|" & sKeyExpr & "|" & sWhereExtra & "|" & _
+           CLng(CDbl(evalDate)) & "|" & b & "|" & nWeeks
+
+    If m_wbCache Is Nothing Then
+        Set m_wbCache = CreateObject("Scripting.Dictionary")
+        m_wbCache.CompareMode = 1
+    End If
+
+    If m_wbCache.Exists(sKey) Then
+        Set WeekBasisMap = m_wbCache(sKey)
+        Exit Function
+    End If
+
+    bStart = BucketStart(evalDate, b)
+    winStart = bStart - (nWeeks * 7)
+
+    Set dRaw = AggMap(sField, sKeyExpr, sWhereExtra, winStart, bStart, True)
+
+    Set dOut = CreateObject("Scripting.Dictionary")
+    dOut.CompareMode = 1
+
+    For Each k In dRaw.Keys
+        dOut(k) = dRaw(k) / nWeeks
+    Next k
+
+    m_wbCache.Add sKey, dOut
+    Set WeekBasisMap = dOut
+End Function
+
+
+'==============================================================================
+' VOLATILITY (v21) - the denominator of the band test.
+'   Same cache (m_wbCache), distinguished by a "VOL|" key prefix so these
+'   never collide with WeekBasisMap's own entries.
+'==============================================================================
+
+'------------------------------------------------------------------------------
+' Sample standard deviation, per key, of the NWeeks individual weekly totals
+' immediately preceding one bucket's start - not their sum (that is
+' WeekBasisMap), the spread across them.
+'
+' dKeys supplies the universe of keys to compute this for: pass the same
+' dictionary the HWA was computed for (dExp at whichever grain is calling),
+' so a key with no receipts in a given week is a genuine zero data point
+' rather than a missing one - AggMap would otherwise simply omit it, which
+' would understate the sample and overstate the apparent stability.
+'
+' Returns an empty dictionary if nWeeks < MIN_VOL_WEEKS: a standard deviation
+' of one or two points is not a measurement. Callers must check for this via
+' m_effTestMode rather than per key - see the v21 header block.
+'
+' v21 TRIM. With VolatilityTrimOutlier = 1, the single week furthest from the
+' key's own mean is excluded before the spread is measured, so one unusual
+' week cannot widen the range and mask a second one right behind it. Only
+' applied when a point can be spared and still clear MIN_VOL_WEEKS.
+'------------------------------------------------------------------------------
+Private Function WeekVolatilityMap(sField As String, sKeyExpr As String, sWhereExtra As String, _
+                                   evalDate As Date, b As Long, nWeeks As Long, _
+                                   dKeys As Object) As Object
+
+    Dim bStart As Date, wFrom As Date, wTo As Date
+    Dim dOut As Object, dWeek As Object, dWeekVals As Object
+    Dim wk As Long, i As Long, iWorst As Long, nEff As Long
+    Dim k As Variant
+    Dim vMean As Double, vVar As Double, dWorst As Double, dDev As Double
+    Dim sKey As String
+    Dim bTrim As Boolean
+    Dim arr() As Double
+
+    Set dOut = CreateObject("Scripting.Dictionary")
+    dOut.CompareMode = 1
+
+    If nWeeks < MIN_VOL_WEEKS Then
+        Set WeekVolatilityMap = dOut
+        Exit Function
+    End If
+
+    ' Only trim if a point can be spared and still meet the floor - never
+    ' silently drop below MIN_VOL_WEEKS worth of data.
+    bTrim = (m_cfg.trimVol = 1) And (nWeeks - 1 >= MIN_VOL_WEEKS)
+
+    sKey = "VOL|" & sField & "|" & sKeyExpr & "|" & sWhereExtra & "|" & _
+           CLng(CDbl(evalDate)) & "|" & b & "|" & nWeeks & "|" & IIf(bTrim, "T", "F")
+
+    If m_wbCache Is Nothing Then
+        Set m_wbCache = CreateObject("Scripting.Dictionary")
+        m_wbCache.CompareMode = 1
+    End If
+
+    If m_wbCache.Exists(sKey) Then
+        Set WeekVolatilityMap = m_wbCache(sKey)
+        Exit Function
+    End If
+
+    bStart = BucketStart(evalDate, b)
+
+    Set dWeekVals = CreateObject("Scripting.Dictionary")
+    dWeekVals.CompareMode = 1
+
+    For Each k In dKeys.Keys
+        ReDim arr(1 To nWeeks)
+        dWeekVals(k) = arr
+    Next k
+
+    For wk = 1 To nWeeks
+        wTo = bStart - ((wk - 1) * 7)
+        wFrom = bStart - (wk * 7)
+        Set dWeek = AggMap(sField, sKeyExpr, sWhereExtra, wFrom, wTo, True)
+
+        For Each k In dKeys.Keys
+            arr = dWeekVals(k)
+            arr(wk) = ValOrZero(dWeek, k)
+            dWeekVals(k) = arr
+        Next k
+    Next wk
+
+    For Each k In dKeys.Keys
+        arr = dWeekVals(k)
+
+        If bTrim Then
+            ' Find this key's single most extreme week against its OWN mean -
+            ' never a cross-key comparison - then drop it before measuring
+            ' spread. Ties keep the earliest week (first strictly-greater wins).
+            vMean = 0
+            For i = 1 To nWeeks: vMean = vMean + arr(i): Next i
+            vMean = vMean / nWeeks
+
+            iWorst = 1
+            dWorst = Abs(arr(1) - vMean)
+            For i = 2 To nWeeks
+                dDev = Abs(arr(i) - vMean)
+                If dDev > dWorst Then
+                    dWorst = dDev
+                    iWorst = i
+                End If
+            Next i
+
+            nEff = nWeeks - 1
+            vMean = 0
+            For i = 1 To nWeeks
+                If i <> iWorst Then vMean = vMean + arr(i)
+            Next i
+            vMean = vMean / nEff
+
+            vVar = 0
+            For i = 1 To nWeeks
+                If i <> iWorst Then vVar = vVar + (arr(i) - vMean) ^ 2
+            Next i
+            vVar = vVar / (nEff - 1)
+        Else
+            nEff = nWeeks
+            vMean = 0
+            For i = 1 To nWeeks: vMean = vMean + arr(i): Next i
+            vMean = vMean / nEff
+
+            vVar = 0
+            For i = 1 To nWeeks: vVar = vVar + (arr(i) - vMean) ^ 2: Next i
+            vVar = vVar / (nEff - 1)
+        End If
+
+        If vVar < 0 Then vVar = 0   ' floating point guard only
+        dOut(k) = Sqr(vVar)
+    Next k
+
+    m_wbCache.Add sKey, dOut
+    Set WeekVolatilityMap = dOut
+End Function
+
+
+'------------------------------------------------------------------------------
+' Month-to-date volatility, per key: the buckets making up the reported
+' window are non-overlapping time windows, so their variances sum and the
+' total is square-rooted - Var(A+B) = Var(A) + Var(B) for independent A, B.
+' The same principle ExpectedMap applies to the mean via SUMX over buckets,
+' applied here to variance instead.
+'------------------------------------------------------------------------------
+Private Function MTDVolatilityMap(sField As String, sKeyExpr As String, sWhereExtra As String, _
+                                  evalDate As Date, weeksDone As Long, nWeeks As Long, _
+                                  dKeys As Object) As Object
+
+    Dim dOut As Object, dBucketVol As Object
+    Dim b As Long
+    Dim k As Variant
+
+    Set dOut = CreateObject("Scripting.Dictionary")
+    dOut.CompareMode = 1
+
+    For Each k In dKeys.Keys
+        dOut(k) = 0
+    Next k
+
+    For b = 1 To weeksDone
+        Set dBucketVol = WeekVolatilityMap(sField, sKeyExpr, sWhereExtra, evalDate, b, nWeeks, dKeys)
+        For Each k In dKeys.Keys
+            If dBucketVol.Exists(k) Then dOut(k) = dOut(k) + dBucketVol(k) * dBucketVol(k)
+        Next k
+    Next b
+
+    For Each k In dKeys.Keys
+        dOut(k) = Sqr(dOut(k))
+    Next k
+
+    Set MTDVolatilityMap = dOut
+End Function
+
+
+' Thin wrapper matching the ExpMap / ActMap style: reads module-level state so
+' call sites stay uncluttered. Always the MTD (mode 2) volatility - the band
+' test only ever runs against the MTD comparison, matching how the plan
+' comparison always uses MTD regardless of PaceMode.
+'
+' NOTE: this passes m_cfg.nWeeks, i.e. the SAME window that sizes the HWA. If
+' the dashboard is ever given a separate volatility-window slicer, this line
+' and a new tbl_Config row are what must change to match it.
+Private Function VolMap(sField As String, sKeyExpr As String, sWhere As String, dKeys As Object) As Object
+    Set VolMap = MTDVolatilityMap(sField, sKeyExpr, sWhere, m_evalDate, m_weeks, m_cfg.nWeeks, dKeys)
+End Function
+
+
+'------------------------------------------------------------------------------
+' The single test that decides whether a row is flagged, used identically at
+' sales-group level (PlantSectionHtml), customer/part-type level
+' (BuildGroupDetail) and engine level (BuildEngineSectionHtml).
+' Centralised so the levels cannot drift apart - the same duplication that let
+' the plan denominator diverge before v20 would have been just as easy to
+' reintroduce here if this test lived in three places.
+'
+' mode 1 (legacy)  - Abs(pace) >= thr, pace = (a-e)/e
+' mode 2 (bands)   - Abs(z) >= thr, z = (a-e)/sigma, sigma from dVol
+'
+' Always reads m_effTestMode, never m_cfg.testMode - see the v21 header block
+' for why the fallback is decided once per run rather than once per row.
+'------------------------------------------------------------------------------
+Private Function SurgeTest(a As Double, e As Double, dVol As Object, k As Variant, _
+                           ByRef zOut As Double) As Boolean
+
+    Dim vSigma As Double
+
+    zOut = NO_PCT   ' default: not computed under mode 1
+
+    If m_effTestMode = 2 Then
+        vSigma = ValOrZero(dVol, k)
+        If vSigma > 0.000001 Then
+            zOut = (a - e) / vSigma
+        ElseIf Abs(a - e) >= m_cfg.dollarFloor Then
+            ' Zero measured spread but a real move: see Z_EXTREME above.
+            If a >= e Then zOut = Z_EXTREME Else zOut = -Z_EXTREME
+        Else
+            zOut = 0
+        End If
+        SurgeTest = (Abs(zOut) >= m_cfg.thr) And (Abs(a - e) >= m_cfg.dollarFloor)
+    Else
+        SurgeTest = (Abs((a - e) / e) >= m_cfg.thr) And (Abs(a - e) >= m_cfg.dollarFloor)
+    End If
+
+End Function
+
+
+'------------------------------------------------------------------------------
+' The HWA per key - the blend of the two bases above - honouring the mode
+' passed in.
+'   mode 1 = the single completed week only
+'   mode 2 = cumulative weeks 1..weeksDone, i.e. CM MTD Expected  [default]
+'
+' The algebra matches the DAX exactly:
+'   here  (1-w)*MB*nBuckets + w*SUM(WB(b))
+'   DAX   SUMX over buckets of [(1-w)*MB + w*WB(b)]  which expands to the same
+'------------------------------------------------------------------------------
+Private Function ExpectedMap(sField As String, sKeyExpr As String, sWhereExtra As String, _
+                             evalDate As Date, weeksDone As Long, nMonths As Long, _
+                             nWeeks As Long, seasW As Double, mode As Long) As Object
+
+    Dim dMB As Object, dWB As Object, dOut As Object
+    Dim dAcc As Object
+    Dim b As Long, bFrom As Long, nBuckets As Long
+    Dim k As Variant
+
+    Set dMB = MonthBasisMap(sField, sKeyExpr, sWhereExtra, evalDate, nMonths)
+
+    Set dAcc = CreateObject("Scripting.Dictionary")
+    dAcc.CompareMode = 1
+
+    If mode = 1 Then
+        bFrom = weeksDone
+        nBuckets = 1
+    Else
+        bFrom = 1
+        nBuckets = weeksDone
+    End If
+
+    For b = bFrom To bFrom + nBuckets - 1
+        Set dWB = WeekBasisMap(sField, sKeyExpr, sWhereExtra, evalDate, b, nWeeks)
+        For Each k In dWB.Keys
+            If dAcc.Exists(k) Then dAcc(k) = dAcc(k) + dWB(k) Else dAcc(k) = dWB(k)
+        Next k
+    Next b
+
+    Set dOut = CreateObject("Scripting.Dictionary")
+    dOut.CompareMode = 1
+
+    For Each k In dMB.Keys
+        If dAcc.Exists(k) Then
+            dOut(k) = (1 - seasW) * dMB(k) * nBuckets + seasW * dAcc(k)
+        Else
+            dOut(k) = (1 - seasW) * dMB(k) * nBuckets
+        End If
+    Next k
+    For Each k In dAcc.Keys
+        If Not dOut.Exists(k) Then dOut(k) = seasW * dAcc(k)
+    Next k
+
+    Set ExpectedMap = dOut
+End Function
+
+
+'------------------------------------------------------------------------------
+' Actual per key for the window the given mode implies.
+'   mode 1 = the single completed week, i.e. CM Bucket Actual
+'   mode 2 = month start to end of the last completed week, i.e. CM MTD Actual
+'------------------------------------------------------------------------------
+Private Function ActualMap(sField As String, sKeyExpr As String, sWhereExtra As String, _
+                           evalDate As Date, weeksDone As Long, mode As Long) As Object
+
+    Dim dFrom As Date, dTo As Date
+
+    If mode = 1 Then
+        dFrom = BucketStart(evalDate, weeksDone)
+    Else
+        dFrom = MonthStart(evalDate)
+    End If
+
+    dTo = BucketEnd(evalDate, weeksDone)
+
+    Set ActualMap = AggMap(sField, sKeyExpr, sWhereExtra, dFrom, dTo, False)
+End Function
+
+
+' Thin wrappers so the callers below stay readable. ExpMap returns the HWA.
+Private Function ExpMap(sField As String, sKeyExpr As String, sWhere As String, mode As Long) As Object
+    Set ExpMap = ExpectedMap(sField, sKeyExpr, sWhere, m_evalDate, m_weeks, _
+                             m_cfg.nMonths, m_cfg.nWeeks, m_cfg.seasW, mode)
+End Function
+
+Private Function ActMap(sField As String, sKeyExpr As String, sWhere As String, mode As Long) As Object
+    Set ActMap = ActualMap(sField, sKeyExpr, sWhere, m_evalDate, m_weeks, mode)
+End Function
+
+
+'------------------------------------------------------------------------------
+' Planned receipts for one plant for the reported month. This is the DAX
+' measure CM Plan Month Total.
+'
+' The workbook holds one row per site per month, so several sites can roll up
+' into one plant.
+'
+' ProratePlan = 1 (the v20 default) scales to the elapsed part of the month,
+' matching the front page of the dashboard. 0 leaves it whole, which matches
+' only the month-by-month measure - on the front page that reads as a
+' catastrophic shortfall for three weeks in every four.
+'------------------------------------------------------------------------------
+Private Function PlanTotal(plantCd As String) As Double
+
+    Dim v As Variant
+    Dim d1 As Date, d2 As Date
+
+    On Error GoTo NoPlan
+
+    d1 = MonthStart(m_evalDate)
+    d2 = MonthEnd(m_evalDate)
+
+    v = DSum("PlannedRcpt", PLAN_TBL, "PlantCd='" & plantCd & "' AND PlanMonth >= " & _
+             SqlDate(d1) & " AND PlanMonth <= " & SqlDate(d2))
+
+    If IsNull(v) Then PlanTotal = 0 Else PlanTotal = CDbl(v)
+
+    If m_cfg.prorate = 1 And m_weeks > 0 Then
+        PlanTotal = PlanTotal * (m_weeks / 4)
+    End If
+
+    Exit Function
+
+NoPlan:
+    PlanTotal = 0
+End Function
+
+
+'------------------------------------------------------------------------------
+' Fill the plan members of one row from its share of the plant total.
+'
+' Mirrors "MTD Planned Receipts by Sales Group (using EST ratio)": the
+' denominator is the plant-wide MTD HWA with every lower-grain filter removed,
+' exactly as REMOVEFILTERS gives the measure.
+'
+' v20: the denominator passed in no longer has zero-actual rows stripped out
+' of it. See the totExpM loop in PlantSectionHtml.
+'------------------------------------------------------------------------------
+Private Sub ApplyPlan(ByRef r As tRow, expMTD As Double, actMTD As Double, _
+                      totExpMTD As Double, planTot As Double)
+
+    Dim ratio As Double
+
+    r.planAct = actMTD
+
+    If totExpMTD > 0 And planTot > 0 And expMTD > 0 Then
+        ratio = expMTD / totExpMTD
+        r.planExp = ratio * planTot
+        r.planGap = r.planAct - r.planExp
+        r.planPace = r.planGap / r.planExp
+    Else
+        r.planExp = 0
+        r.planGap = 0
+        r.planPace = NO_PCT
+    End If
+
+End Sub
+
+
+Private Function SumValues(d As Object) As Double
+    Dim k As Variant, t As Double
+    For Each k In d.Keys
+        If d(k) > 0 Then t = t + d(k)
+    Next k
+    SumValues = t
+End Function
+
+Private Function ValOrZero(d As Object, k As Variant) As Double
+    If d.Exists(k) Then ValOrZero = d(k) Else ValOrZero = 0
+End Function
+
+
+'==============================================================================
+' SORTING
+'==============================================================================
+' Ranking key for one row, honouring SortBy. Always the HWA comparison -
+' pace and variance - never the plan or quantity ones.
+Private Function RankKey(r As tRow, sortBy As Long) As Double
+    ' v21: under band mode, ranking follows the same test that decided
+    ' membership - see the v21 header block for why. SortBy only still
+    ' matters (dollar vs percent) when running the legacy percentage test.
+    If m_effTestMode = 2 Then
+        RankKey = Abs(r.zScore)
+    ElseIf sortBy = 1 Then
+        RankKey = Abs(r.gap)
+    Else
+        RankKey = Abs(r.pace)
+    End If
+End Function
+
+
+Private Sub SortRows(arr() As tRow, lo As Long, hi As Long, sortBy As Long)
+    Dim i As Long, j As Long
+    Dim tmp As tRow
+
+    For i = lo To hi - 1
+        For j = lo To hi - 1 - (i - lo)
+            If RankKey(arr(j), sortBy) < RankKey(arr(j + 1), sortBy) Then
+                tmp = arr(j)
+                arr(j) = arr(j + 1)
+                arr(j + 1) = tmp
+            End If
+        Next j
+    Next i
+End Sub
+
+
+'==============================================================================
+' ENTRY POINTS
+'   Names deliberately unchanged - Task Scheduler and AutoExec call them by
+'   name.
+'==============================================================================
+'------------------------------------------------------------------------------
+' Scheduled entry point. Must never leave a modal dialog on screen - on an
+' unattended box that hangs the Access instance until someone signs in.
+'------------------------------------------------------------------------------
+Public Function RBDB_RunAlert()
+
+    On Error GoTo Fail
+    ProcessPending False
+    Exit Function
+
+Fail:
+    On Error Resume Next
+    CurrentDb.Execute "INSERT INTO tbl_AlertLog (RunDate, EvalYM, EvalWeek, " & _
+        "GroupsFlagged, Sent, Detail) VALUES (Now(), 0, 0, 0, False, '" & _
+        Replace("ERR " & Err.Number & ": " & Err.Description, "'", "''") & "')"
+
+End Function
+
+
+'------------------------------------------------------------------------------
+' Interactive entry point. Errors are allowed to surface here.
+'------------------------------------------------------------------------------
+Public Function RBDB_Test()
+    ProcessPending True
+End Function
+
+
+Private Function ProcessPending(bForce As Boolean) As Long
+
+    Dim cmRef As Date, prevRef As Date
+    Dim weeksDone As Long, w As Long
+    Dim nSent As Long
+    Dim lag As Long
+    Dim sMsg As String
+
+    ' Pending queue - collected first so only the newest gets emailed.
+    Dim pd() As Date, pr() As Date, pw() As Long
+    Dim nPending As Long, i As Long
+
+    RefreshLocal
+    LoadCfg                  ' the clock and the lag guard both read tbl_Config
+    m_dataWarn = ""
+
+    ' The bucket the CALENDAR says is due, not the one the data implies. Under
+    ' TriggerMode = 2 these fall back to the v18 anchor chain.
+    cmRef = DueEvalDate()
+    weeksDone = DueWeek()
+
+    ReDim pd(0 To 10)
+    ReDim pr(0 To 10)
+    ReDim pw(0 To 10)
+    nPending = 0
+
+    '--- the previous month, in case its week 4 was never reported ------------
+    prevRef = MonthStart(cmRef) - 1
+
+    If DCount("*", LOCAL_TBL, _
+              "RcvdDate >= " & SqlDate(MonthStart(prevRef)) & _
+              " AND RcvdDate <= " & SqlDate(prevRef)) > 0 Then
+
+        For w = 1 To 4
+            If Not AlreadySent(YMOf(prevRef), w) Then
+                pd(nPending) = prevRef: pr(nPending) = prevRef: pw(nPending) = w
+                nPending = nPending + 1
+            End If
+        Next w
+    End If
+
+    '--- the anchor month, every completed week ------------------------------
+    For w = 1 To weeksDone
+        If Not AlreadySent(YMOf(cmRef), w) Or (bForce And w = weeksDone) Then
+            pd(nPending) = cmRef: pr(nPending) = cmRef: pw(nPending) = w
+            nPending = nPending + 1
+        End If
+    Next w
+
+    ' Only the most recent pending week is evaluated and (maybe) emailed.
+    For i = 0 To nPending - 2
+        LogSkipped GetDb(), pd(i), pr(i), pw(i)
+        sMsg = sMsg & Format(pd(i), "mmm yyyy") & " week " & pw(i) & _
+               ": superseded by a newer pending week - not sent." & vbCrLf
+    Next i
+
+    If nPending > 0 Then
+        i = nPending - 1
+
+        ' Sending against a workbook that stopped refreshing would report every
+        ' group at -100%. Defer instead, and let tomorrow's scheduled run try
+        ' again - unless we have deferred for long enough, or this is an
+        ' interactive test, in which case send and say so on the face of it.
+        lag = DataLagState(pd(i), pw(i))
+
+        If lag = 1 And Not bForce Then
+            LogRun GetDb(), pd(i), WindowEnd(pd(i), pw(i)), pw(i), 0, False, _
+                   "deferred - source data only reaches " & _
+                   Format(RefDateGlobal(), "dd mmm yyyy")
+
+            sMsg = sMsg & Format(pd(i), "mmm yyyy") & " " & _
+                   IIf(m_cfg.mode = 2 And pw(i) > 1, "weeks 1 to " & pw(i), "week " & pw(i)) & _
+                   " is due, but the staged data only reaches " & _
+                   Format(RefDateGlobal(), "dd mmm yyyy") & " and the window runs to " & _
+                   Format(WindowEnd(pd(i), pw(i)), "dd mmm yyyy") & "." & vbCrLf & _
+                   "Deferred - the next scheduled run will try again. It sends anyway " & _
+                   "after " & m_cfg.maxDefer & " day(s), with a banner." & vbCrLf
+        Else
+            If lag >= 1 Then m_dataWarn = DataWarnTxt(pd(i), pw(i))
+            If EvaluateAndSend(pd(i), pr(i), pw(i), bForce, sMsg) Then nSent = 1
+        End If
+    End If
+
+    If bForce Then
+        If Len(sMsg) = 0 Then
+            sMsg = "Nothing outstanding." & vbCrLf & vbCrLf & _
+                   "Trigger         : " & IIf(m_cfg.trigMode = 1, _
+                       "calendar - bucket start", "data driven (v18)") & vbCrLf & _
+                   "Pace mode       : " & IIf(m_cfg.mode = 2, _
+                       "2 - month to date (dashboard parity)", _
+                       "1 - single week (NO dashboard equivalent)") & vbCrLf & _
+                   "Today           : " & Format(Date, "dd mmm yyyy") & vbCrLf & _
+                   "Bucket due      : " & Format(cmRef, "mmm yyyy") & " week " & weeksDone & vbCrLf & _
+                   "Window ends     : " & Format(WindowEnd(cmRef, weeksDone), "dd mmm yyyy") & vbCrLf & _
+                   "Data reaches    : " & Format(RefDateGlobal(), "dd mmm yyyy")
+        End If
+        MsgBox sMsg, vbInformation, APP_NAME & " alert - test run"
+    End If
+
+    ProcessPending = nSent
+End Function
+
+
+Private Sub LogSkipped(db As DAO.Database, evalDate As Date, refCap As Date, weeksDone As Long)
+    db.Execute "INSERT INTO tbl_AlertLog (RunDate, EvalYM, EvalWeek, RefDate, " & _
+               "GroupsFlagged, Sent, Detail) VALUES (Now(), " & YMOf(evalDate) & ", " & _
+               weeksDone & ", " & SqlDate(refCap) & ", 0, True, " & _
+               "'superseded by newer pending week - not sent')", dbFailOnError
+End Sub
+
+
+Private Function AlreadySent(lYM As Long, lWeek As Long) As Boolean
+    AlreadySent = (Nz(DCount("*", "tbl_AlertLog", _
+                   "EvalYM=" & lYM & " AND EvalWeek=" & lWeek & " AND Sent=True"), 0) > 0)
+End Function
+
+
+'==============================================================================
+' MAIN EVALUATION
+'   One pass per plant, PWCS then CAS, each producing a self-contained section.
+'   The email goes out if either plant flagged anything.
+'==============================================================================
+Private Function EvaluateAndSend(evalDate As Date, refCap As Date, weeksDone As Long, _
+                                 bForce As Boolean, ByRef sMsg As String) As Boolean
+
+    Dim db As DAO.Database
+    Dim p As Long, nFlag As Long, nTotal As Long
+    Dim sSections As String
+    Dim sSubject As String, sBody As String
+
+    Set db = GetDb()
+
+    LoadCfg
+    m_evalDate = evalDate
+    m_weeks = weeksDone
+
+    ' "Source data as at" has to be the honest currency of the staged rows. On
+    ' the calendar trigger refCap is a calendar date, which would claim the data
+    ' is newer than it is, so the stamp comes off the data itself.
+    If m_cfg.trigMode = 1 Then m_refCap = RefDateGlobal() Else m_refCap = refCap
+
+    For p = 0 To PlantCount() - 1
+        nFlag = 0
+        sSections = sSections & PlantSectionHtml(db, PlantCode(p), PlantName(p), nFlag, sMsg)
+        nTotal = nTotal + nFlag
+    Next p
+
+    If nTotal = 0 Then
+        ' Logged as HANDLED, not as failed. A clean bucket is a result, and
+        ' logging it False meant the same week re-evaluated on every daily run
+        ' until something tripped. Change True to False here to go back to that.
+        LogRun db, evalDate, WindowEnd(evalDate, weeksDone), weeksDone, 0, True, _
+               "no groups flagged - nothing to send"
+        sMsg = sMsg & Format(evalDate, "mmm yyyy") & " week " & weeksDone & _
+               ": no group breached the threshold in either plant - nothing sent, " & _
+               "bucket closed." & vbCrLf
+        EvaluateAndSend = False
+        Exit Function
+    End If
+
+    sSubject = APP_NAME & " surge/drop alert - " & Format(evalDate, "mmm yyyy") & _
+               " " & WeekSpanLabel()
+
+    ' Flagged in the subject as well as the body: someone triaging on a phone
+    ' should not have to open it to find out the figures are short.
+    If Len(m_dataWarn) > 0 Then
+        sSubject = sSubject & " (source data to " & Format(RefDateGlobal(), "dd mmm") & ")"
+    End If
+
+    sBody = BodyHtml(sSections, nTotal)
+
+    ' Send first, then log. Logging Sent=True before the send means a failed
+    ' relay would be recorded as delivered and AlreadySent() would suppress
+    ' the retry permanently.
+    SendAlert sSubject, sBody
+    LogRun db, evalDate, WindowEnd(evalDate, weeksDone), weeksDone, nTotal, True, _
+           IIf(Len(m_dataWarn) > 0, "sent on short data - reaches " & _
+               Format(RefDateGlobal(), "dd mmm yyyy"), "")
+
+    EvaluateAndSend = True
+End Function
+
+
+'------------------------------------------------------------------------------
+' Everything for one plant: flag its sales groups, rank them, build its
+' summary rows, the Top Engines table and its detail panels, and return the
+' finished section.
+'
+' THE PLAN DENOMINATOR (v20). totExpM is computed over EVERY sales group in
+' the plant - no threshold filter, no zero-receipt filter, no MinExpected -
+' because that is exactly what REMOVEFILTERS gives the DAX measure. Narrowing
+' it in any way does not just hide rows; it shifts the plan share on every
+' row that IS reported. Up to v19 the HideZeroReceipts flag narrowed it, which
+' is why the plan columns never quite tied to the dashboard.
+'------------------------------------------------------------------------------
+Private Function PlantSectionHtml(db As DAO.Database, plantCd As String, plantNm As String, _
+                                  ByRef nFlagOut As Long, ByRef sMsg As String) As String
+
+    Dim sWhereP As String
+    Dim dAct As Object, dExp As Object
+    Dim dQAct As Object, dQExp As Object
+    Dim dActM As Object, dExpM As Object
+    Dim k As Variant
+    Dim grps() As tRow
+    Dim nG As Long, i As Long
+    Dim a As Double, qa As Double, qe As Double, pace As Double
+    Dim totExpM As Double, planTot As Double
+    Dim netGap As Double, netQGap As Double, netPGap As Double
+    Dim totBreach As Long, nDead As Long
+    Dim drvBlock() As String, panel() As String
+    Dim sSummary As String, s As String
+    Dim dVol As Object, vZ As Double          ' v21
+
+    sWhereP = "PlantCd='" & plantCd & "'"
+
+    '--- level 1: sales groups ------------------------------------------------
+    ' The threshold is judged on receipts value against the HWA. Quantity is
+    ' computed the same way for context. The plan comparison is always
+    ' month-to-date, whatever PaceMode says.
+    Set dAct = ActMap(FLD_VALUE, "SalesGrp", sWhereP, m_cfg.mode)
+    Set dExp = ExpMap(FLD_VALUE, "SalesGrp", sWhereP, m_cfg.mode)
+    Set dQAct = ActMap(FLD_QTY, "SalesGrp", sWhereP, m_cfg.mode)
+    Set dQExp = ExpMap(FLD_QTY, "SalesGrp", sWhereP, m_cfg.mode)
+
+    If m_cfg.mode = 2 Then
+        Set dActM = dAct
+        Set dExpM = dExp
+    Else
+        Set dActM = ActMap(FLD_VALUE, "SalesGrp", sWhereP, 2)
+        Set dExpM = ExpMap(FLD_VALUE, "SalesGrp", sWhereP, 2)
+    End If
+
+    '--- the plan denominator: every group, unfiltered ------------------------
+    ' v20: no hideZero test here. See the header comment above.
+    totExpM = 0
+    For Each k In dExpM.Keys
+        If dExpM(k) > 0 Then totExpM = totExpM + dExpM(k)
+    Next k
+
+    planTot = PlanTotal(plantCd)
+
+    ' v21: computed once per plant, over the same key universe as dExp, so
+    ' every row's SurgeTest call below reuses it rather than re-querying.
+    If m_effTestMode = 2 Then
+        Set dVol = VolMap(FLD_VALUE, "SalesGrp", sWhereP, dExp)
+    End If
+
+    ReDim grps(0 To dExp.Count + dAct.Count)
+    nG = 0
+
+    For Each k In dExp.Keys
+        If dExp(k) > 0 And dExp(k) >= m_cfg.minExp Then
+            a = ValOrZero(dAct, k)
+            pace = (a - dExp(k)) / dExp(k)
+
+            ' v20: a group that received NOTHING is no longer skipped. It sits
+            ' at -100%, breaches any threshold at or below 100%, and is the
+            ' loudest signal this system can produce - it was previously the
+            ' one thing that never generated an email. Its band position
+            ' (mode 2) lands on Z_EXTREME for the same reason - see SurgeTest.
+            If SurgeTest(a, dExp(k), dVol, k, vZ) Then
+                qa = ValOrZero(dQAct, k)
+                qe = ValOrZero(dQExp, k)
+
+                grps(nG).Label = CStr(k)
+                grps(nG).act = a
+                grps(nG).exp = dExp(k)
+                grps(nG).gap = a - grps(nG).exp
+                grps(nG).pace = pace
+                grps(nG).zScore = vZ
+                grps(nG).qAct = qa
+                grps(nG).qExp = qe
+                grps(nG).qGap = qa - qe
+                If qe > 0 Then grps(nG).qPace = (qa - qe) / qe Else grps(nG).qPace = NO_PCT
+
+                ApplyPlan grps(nG), ValOrZero(dExpM, k), ValOrZero(dActM, k), totExpM, planTot
+
+                If a = 0 Then nDead = nDead + 1
+
+                nG = nG + 1
+            End If
+        End If
+    Next k
+
+    nFlagOut = nG
+
+    s = PlantHeadingHtml(plantNm, plantCd)
+
+    If nG = 0 Then
+        s = s & "<font face='Segoe UI' size='2' color='" & C_MUTED & "'><i>" & _
+                "No sales group moved " & OutsideTxt() & _
+                " over " & WeekSpanLabel() & "." & _
+                "</i></font><br><br>"
+
+        sMsg = sMsg & plantNm & " (" & plantCd & "): nothing breached the " & _
+               ThresholdShort() & " threshold." & vbCrLf
+
+        PlantSectionHtml = s
+        Exit Function
+    End If
+
+    '--- one ranking, applied everywhere in this plant ------------------------
+    SortRows grps, 0, nG - 1, m_cfg.sortBy
+
+    ReDim drvBlock(0 To nG - 1)
+    ReDim panel(0 To nG - 1)
+
+    For i = 0 To nG - 1
+        BuildGroupDetail db, grps(i), sWhereP, totExpM, planTot, _
+                         ((m_cfg.maxGrp <= 0) Or (i < m_cfg.maxGrp)), drvBlock(i)
+
+        netGap = netGap + grps(i).gap
+        netQGap = netQGap + grps(i).qGap
+        netPGap = netPGap + grps(i).planGap
+        totBreach = totBreach + grps(i).nSub
+    Next i
+
+    For i = 0 To nG - 1
+        sSummary = sSummary & SummaryRowHtml(grps(i), i)
+        panel(i) = GroupPanelHtml(grps(i), i, drvBlock(i))
+    Next i
+
+    '--- counters -------------------------------------------------------------
+    ' Units are spelled out here rather than left to the symbol, because this
+    ' line is the one figure most readers quote onward out of context.
+    s = s & "<font face='Segoe UI' size='3'>"
+    s = s & "<b>" & nG & " sales group(s)</b> breached the " & ThresholdShort() & _
+            " threshold, a net VAR vs HWA of <b>" & MoneySigned(netGap) & "</b>"
+    If planTot > 0 Then
+        s = s & " and a net VAR vs Plan MML of <b>" & MoneySigned(netPGap) & "</b>"
+    End If
+    s = s & ". Within them, <b>" & totBreach & "</b> customer / part type combination(s) " & _
+            "breached the same threshold, a net <b>" & QtySigned(netQGap) & " " & UNIT_QTY & _
+            "</b> against the quantity HWA."
+
+    ' v20: called out explicitly. A group at -100% is the most serious thing
+    ' on the page and it should not have to be inferred from the table.
+    If nDead > 0 Then
+        s = s & " <font color='" & C_ALERT & "'><b>" & nDead & "</b> of them received " & _
+                "<b>nothing at all</b> in this window.</font>"
+    End If
+
+    s = s & "</font><br><br>"
+
+    '--- summary --------------------------------------------------------------
+    s = s & "<font face='Segoe UI' size='3'><b>Summary by sales group</b></font>"
+    s = s & " <font size='2' color='" & C_MUTED & "'>highest " & RankLabel() & " first</font><br>"
+    s = s & "<table border='1' cellpadding='0' cellspacing='0' " & _
+            "style='border-collapse:collapse;border-color:" & C_BORDER & ";margin:4px 0 10px 0'>"
+    s = s & SummaryHeaderHtml()
+    s = s & sSummary
+    s = s & "</table>"
+
+    '--- engine level: every engine in this plant that breached ---------------
+    s = s & BuildEngineSectionHtml(sWhereP, totExpM, planTot)
+
+    '--- panels ---------------------------------------------------------------
+    s = s & "<br><br><font face='Segoe UI' size='3'><b>Detail by sales group</b></font>"
+    s = s & " <font size='2' color='" & C_MUTED & "'>same order as above, top " & _
+            m_cfg.topDrv & " breached combinations each; actual and HWA are in " & _
+            "the summary table</font><br><br>"
+    s = s & PanelGridHtml(panel, nG)
+
+    '--- pointer to the legend box at the foot ---------------------------------
+    ' Printed once under each plant section, so a reader who stops at PWCS
+    ' still knows where the definitions are.
+    s = s & "<font face='Segoe UI' size='2' color='" & C_MUTED & "'><i>" & _
+            "Not sure what a column means? See &#8220;How to read this email&#8221; " & _
+            "at the foot of this message." & _
+            "</i></font><br><br>"
+
+    sMsg = sMsg & plantNm & " (" & plantCd & "): " & nG & " group(s) flagged, " & _
+           totBreach & " part type(s) breached, net " & MoneySigned(netGap) & _
+           " vs HWA." & IIf(nDead > 0, " " & nDead & " received nothing.", "") & vbCrLf
+
+    PlantSectionHtml = s
+End Function
+
+
+'------------------------------------------------------------------------------
+' Engine level analysis: every engine model in the plant that breached the
+' threshold, one row each, highest anomaly first.
+'
+' The key is EngModel alone - no sales group, no customer, no part type. An
+' engine that goes quiet inside an otherwise healthy sales group is invisible
+' at group grain and never reaches a detail panel; here it is judged against
+' its own history and appears on its own.
+'
+' NO CAP. Every engine that breaches is listed. AggMap drops null and blank
+' engine models, so receipts with no [Eng Model] are not represented here.
+'
+' Rows that received NOTHING are excluded and counted - they are all at
+' exactly -100% and cannot be ranked against each other. That exclusion is
+' unconditional, not gated on HideZeroReceipts.
+'
+' PLAN COLUMNS: totExpM is the plant total of the SALES-GROUP HWAs, so an
+' engine-grain share of it is indicative rather than additive - these rows
+' will not sum to the plant plan. Same denominator BuildGroupDetail uses, so
+' all three grains split the plan the same way.
+'------------------------------------------------------------------------------
+Private Function BuildEngineSectionHtml(sWhereP As String, totExpM As Double, planTot As Double) As String
+
+    ' Plain SQL - no function calls. See the SQL EXPRESSION WARNING at the top.
+    Const KEY_EXPR As String = "EngModel"
+
+    Dim dAct As Object, dExp As Object
+    Dim dQAct As Object, dQExp As Object
+    Dim dActM As Object, dExpM As Object
+    Dim k As Variant
+    Dim arr() As tRow
+    Dim nD As Long, i As Long, nZeroCnt As Long
+    Dim a As Double, e As Double
+    Dim qa As Double, qe As Double
+    Dim dVol As Object, vZ As Double
+    Dim s As String
+
+    Set dAct = ActMap(FLD_VALUE, KEY_EXPR, sWhereP, m_cfg.mode)
+    Set dExp = ExpMap(FLD_VALUE, KEY_EXPR, sWhereP, m_cfg.mode)
+    Set dQAct = ActMap(FLD_QTY, KEY_EXPR, sWhereP, m_cfg.mode)
+    Set dQExp = ExpMap(FLD_QTY, KEY_EXPR, sWhereP, m_cfg.mode)
+
+    If m_cfg.mode = 2 Then
+        Set dActM = dAct
+        Set dExpM = dExp
+    Else
+        Set dActM = ActMap(FLD_VALUE, KEY_EXPR, sWhereP, 2)
+        Set dExpM = ExpMap(FLD_VALUE, KEY_EXPR, sWhereP, 2)
+    End If
+
+    If m_effTestMode = 2 Then
+        Set dVol = VolMap(FLD_VALUE, KEY_EXPR, sWhereP, dExp)
+    End If
+
+    ReDim arr(0 To dExp.Count)
+    nD = 0
+
+    For Each k In dExp.Keys
+        e = dExp(k)
+        If e > 0 And e >= m_cfg.minExp Then
+            a = ValOrZero(dAct, k)
+
+            ' Keep only the engines that genuinely breached the threshold.
+            If SurgeTest(a, e, dVol, k, vZ) Then
+
+                ' a > 0 rather than a <> 0, so an engine whose window is net
+                ' negative on adjustments alone is also excluded - it did not
+                ' receive either.
+                If a > 0 Then
+                    qa = ValOrZero(dQAct, k)
+                    qe = ValOrZero(dQExp, k)
+
+                    arr(nD).Label = CStr(k)
+                    arr(nD).act = a
+                    arr(nD).exp = e
+                    arr(nD).gap = a - e
+                    arr(nD).pace = (a - e) / e
+                    arr(nD).zScore = vZ
+                    arr(nD).qAct = qa
+                    arr(nD).qExp = qe
+                    arr(nD).qGap = qa - qe
+                    If qe > 0 Then arr(nD).qPace = (qa - qe) / qe Else arr(nD).qPace = NO_PCT
+
+                    ApplyPlan arr(nD), ValOrZero(dExpM, k), ValOrZero(dActM, k), totExpM, planTot
+
+                    nD = nD + 1
+                Else
+                    nZeroCnt = nZeroCnt + 1
+                End If
+            End If
+        End If
+    Next k
+
+    s = "<br><br><font face='Segoe UI' size='3'><b>Summary by engine model</b></font>"
+
+    '--- nothing to show ------------------------------------------------------
+    ' Still prints the heading and a one-line note rather than vanishing, so a
+    ' reader is never left wondering whether the section ran.
+    If nD = 0 Then
+        s = s & "<br><font face='Segoe UI' size='2' color='" & C_MUTED & "'><i>" & _
+                "No engine model with receipts moved " & OutsideTxt() & _
+                " over " & WeekSpanLabel() & "."
+        If nZeroCnt > 0 Then
+            s = s & " <b>" & nZeroCnt & "</b> engine model(s) received nothing at all " & _
+                    "in this window."
+        End If
+        s = s & "</i></font><br><br>"
+
+        BuildEngineSectionHtml = s
+        Exit Function
+    End If
+
+    SortRows arr, 0, nD - 1, m_cfg.sortBy
+
+    s = s & " <font size='2' color='" & C_MUTED & "'>every engine in this plant that " & _
+            "breached, highest " & RankLabel() & " first</font><br>"
+    s = s & "<table border='1' cellpadding='0' cellspacing='0' " & _
+            "style='border-collapse:collapse;border-color:" & C_BORDER & ";margin:4px 0 10px 0'>"
+    s = s & EngineHeaderHtml()
+
+    ' No cap: every engine that breached is listed.
+    For i = 0 To nD - 1
+        s = s & EngineRowHtml(arr(i), i)
+    Next i
+
+    s = s & "</table>"
+
+    If nZeroCnt > 0 Then
+        s = s & "<font face='Segoe UI' size='2' color='" & C_MUTED & "'><i>" & _
+                "A further <b>" & nZeroCnt & "</b> engine model(s) breached but received " & _
+                "nothing at all in this window, so they are not listed - every one of " & _
+                "them is at &minus;100%.</i></font><br>"
+    End If
+
+    BuildEngineSectionHtml = s
+End Function
+
+
+'------------------------------------------------------------------------------
+' For one sales group: rank the customer/part-type combinations that breached
+' the threshold and render their table rows.
+'
+' HideZeroReceipts applies HERE and nowhere else. Combinations that received
+' nothing are all exactly -100%, so ranking them says nothing beyond what the
+' group line already said. Set the flag to 0 to list them anyway.
+'------------------------------------------------------------------------------
+Private Sub BuildGroupDetail(db As DAO.Database, ByRef grp As tRow, sWhereP As String, _
+                             totExpM As Double, planTot As Double, _
+                             bShowDrivers As Boolean, ByRef sDrvBlock As String)
+
+    Const KEY_EXPR As String = "CustName & ' / ' & PartType"
+
+    Dim sWhere As String
+    Dim dAct As Object, dExp As Object
+    Dim dQAct As Object, dQExp As Object
+    Dim dActM As Object, dExpM As Object
+    Dim k As Variant
+    Dim drv() As tRow
+    Dim nD As Long, nZeroCnt As Long
+    Dim a As Double, e As Double, p As Double
+    Dim qa As Double, qe As Double
+    Dim i As Long, nShow As Long
+    Dim s As String
+    Dim dVol As Object, vZ As Double          ' v21
+
+    sDrvBlock = ""
+
+    sWhere = sWhereP & " AND SalesGrp='" & Esc(grp.Label) & "'"
+
+    Set dAct = ActMap(FLD_VALUE, KEY_EXPR, sWhere, m_cfg.mode)
+    Set dExp = ExpMap(FLD_VALUE, KEY_EXPR, sWhere, m_cfg.mode)
+    Set dQAct = ActMap(FLD_QTY, KEY_EXPR, sWhere, m_cfg.mode)
+    Set dQExp = ExpMap(FLD_QTY, KEY_EXPR, sWhere, m_cfg.mode)
+
+    If m_cfg.mode = 2 Then
+        Set dActM = dAct
+        Set dExpM = dExp
+    Else
+        Set dActM = ActMap(FLD_VALUE, KEY_EXPR, sWhere, 2)
+        Set dExpM = ExpMap(FLD_VALUE, KEY_EXPR, sWhere, 2)
+    End If
+
+    ' v21: same denominator logic as PlantSectionHtml, scoped to this group's
+    ' customer/part-type keys instead of the plant's sales groups.
+    If m_effTestMode = 2 Then
+        Set dVol = VolMap(FLD_VALUE, KEY_EXPR, sWhere, dExp)
+    End If
+
+    ReDim drv(0 To dExp.Count + 1)
+
+    For Each k In dExp.Keys
+        e = dExp(k)
+        If e > 0 And e >= m_cfg.minExp Then
+            a = ValOrZero(dAct, k)
+            qa = ValOrZero(dQAct, k)
+            qe = ValOrZero(dQExp, k)
+            p = (a - e) / e
+
+            If m_cfg.hideZero = 1 And a = 0 Then
+                nZeroCnt = nZeroCnt + 1
+            ElseIf SurgeTest(a, e, dVol, k, vZ) Then
+                drv(nD).Label = CStr(k)
+                drv(nD).act = a
+                drv(nD).exp = e
+                drv(nD).gap = a - e
+                drv(nD).pace = p
+                drv(nD).zScore = vZ
+                drv(nD).qAct = qa
+                drv(nD).qExp = qe
+                drv(nD).qGap = qa - qe
+                If qe > 0 Then drv(nD).qPace = (qa - qe) / qe Else drv(nD).qPace = NO_PCT
+
+                ' Same denominator as the sales group level: the plant total.
+                ApplyPlan drv(nD), ValOrZero(dExpM, k), ValOrZero(dActM, k), totExpM, planTot
+
+                nD = nD + 1
+            End If
+        End If
+    Next k
+
+    grp.nSub = nD
+    grp.nZero = nZeroCnt
+
+    '--- breached combinations, highest anomaly first -------------------------
+    If bShowDrivers And nD > 0 Then
+        SortRows drv, 0, nD - 1, m_cfg.sortBy
+
+        nShow = nD
+        If nShow > m_cfg.topDrv Then nShow = m_cfg.topDrv
+
+        For i = 0 To nShow - 1
+            s = s & DriverRowHtml(drv(i), i + 1)
+        Next i
+
+        If nD > nShow Then
+            s = s & "<tr><td colspan='8' nowrap style='padding:3px 4px'>" & _
+                    "<font face='Segoe UI' size='2' color='" & C_MUTED & "'><i>+ " & (nD - nShow) & _
+                    " more</i></font></td></tr>"
+        End If
+
+        sDrvBlock = s
+    End If
+
+End Sub
+
+
+'==============================================================================
+' HTML
+'   No table is width='100%'. Each sizes itself to its own contents, and every
+'   cell is nowrap so figures never break across two lines. The one exception
+'   is the legend box, which is prose and is given a fixed width.
+'
+'   Summary     : 13 columns, 14 under band mode (the extra one is VERDICT) -
+'                 rank, group, four/five vs HWA, three vs PLAN, four QTY.
+'   Engines     : the same 13 / 14 columns as Summary, with the engine model
+'                 as the label. Every engine that breached, no cap.
+'   Panel       :  8 columns - rank, label, two vs HWA, two vs PLAN, two QTY.
+'   Actual and HWA are dropped from the panels so two still fit per row, and
+'   the panel's VERDICT lives on its title line rather than in a column.
+'==============================================================================
+
+'------------------------------------------------------------------------------
+' Compact magnitude: 842, 3.4K, 139K, 1.2M, 14M. Unsigned - the caller adds
+' the sign and the currency symbol.
+'------------------------------------------------------------------------------
+Private Function Abbrev(v As Double) As String
+
+    Dim a As Double
+    a = Abs(v)
+
+    If a >= 10000000 Then
+        Abbrev = Format(a / 1000000, "#,##0") & "M"
+    ElseIf a >= 1000000 Then
+        Abbrev = Format(a / 1000000, "0.0") & "M"
+    ElseIf a >= 100000 Then
+        Abbrev = Format(a / 1000, "#,##0") & "K"
+    ElseIf a >= 1000 Then
+        Abbrev = Format(a / 1000, "0.0") & "K"
+    Else
+        Abbrev = Format(a, "0")
+    End If
+End Function
+
+Private Function Money(v As Double) As String
+    If v < 0 Then Money = "-$" & Abbrev(v) Else Money = "$" & Abbrev(v)
+End Function
+
+Private Function MoneySigned(v As Double) As String
+    If v < 0 Then MoneySigned = "-$" & Abbrev(v) Else MoneySigned = "+$" & Abbrev(v)
+End Function
+
+Private Function Qty(v As Double) As String
+    If Abs(v) >= 100000 Then Qty = Abbrev(v) Else Qty = Format(v, "#,##0")
+End Function
+
+Private Function QtySigned(v As Double) As String
+    If Abs(v) >= 100000 Then
+        If v < 0 Then QtySigned = "-" & Abbrev(v) Else QtySigned = "+" & Abbrev(v)
+    Else
+        QtySigned = Format(v, "+#,##0;-#,##0")
+    End If
+End Function
+
+' Plan figures only exist where the workbook had a plan for the plant and the
+' row carried some HWA to take a share of. Everything else is a dash rather
+' than a misleading zero.
+Private Function PlanMoney(r As tRow) As String
+    If r.planPace = NO_PCT Then PlanMoney = "-" Else PlanMoney = Money(r.planExp)
+End Function
+
+Private Function PlanGapTxt(r As tRow) As String
+    If r.planPace = NO_PCT Then PlanGapTxt = "-" Else PlanGapTxt = MoneySigned(r.planGap)
+End Function
+
+'------------------------------------------------------------------------------
+' Escape a label and clip it to n characters. Clipping happens before escaping
+' so the count is of visible characters, not of &amp; sequences.
+'------------------------------------------------------------------------------
+Private Function LabelHtml(s As String, n As Long) As String
+    If Len(s) <= n Then
+        LabelHtml = HtmlEsc(s)
+    Else
+        LabelHtml = HtmlEsc(RTrim(Left(s, n - 1))) & "&#8230;"
+    End If
+End Function
+
+'------------------------------------------------------------------------------
+' Two-line label. The key is "customer / part type" in the panels and
+' "customer / engine model" in the Top Engines table, and the two halves are
+' put on SEPARATE LINES - customer above, muted, the second field below. That
+' makes the column as wide as the longer of the two rather than the sum.
+'------------------------------------------------------------------------------
+Private Function ItemLabelHtml(s As String) As String
+
+    Dim p As Long
+
+    p = InStr(s, " / ")
+
+    If p = 0 Then
+        ItemLabelHtml = LabelHtml(s, MAX_ITEM_LABEL)
+    Else
+        ItemLabelHtml = "<font color='" & C_MUTED & "'>" & _
+                        LabelHtml(RTrim(Left(s, p - 1)), MAX_CUST_LABEL) & _
+                        "</font><br>" & _
+                        LabelHtml(Mid(s, p + 3), MAX_PART_LABEL)
+    End If
+End Function
+
+' Formats a pace, or a dash when the denominator was zero.
+Private Function PaceTxt(p As Double) As String
+    If p = NO_PCT Then
+        PaceTxt = "-"
+    Else
+        PaceTxt = Format(p, "+0.0%;-0.0%")
+    End If
+End Function
+
+Private Function PaceCol(p As Double) As String
+    If p = NO_PCT Then
+        PaceCol = C_MUTED
+    ElseIf p >= 0 Then
+        PaceCol = "#006100"
+    Else
+        PaceCol = "#9C0006"
+    End If
+End Function
+
+'------------------------------------------------------------------------------
+' v22. The vs-HWA column ALWAYS shows % CHG, in either test mode. Under
+' SurgeTestMode 2 the band position still decides which rows appear and in
+' what order - it is simply not printed as a number. What the reader gets
+' instead is VerdictTxt below, in words.
+'
+' These three are kept as separate functions rather than inlined so that
+' putting the sigma count back is a one-function change if it is ever wanted.
+'------------------------------------------------------------------------------
+Private Function TestTxt(r As tRow) As String
+    TestTxt = PaceTxt(r.pace)
+End Function
+
+Private Function TestCol(r As tRow) As String
+    TestCol = PaceCol(r.pace)
+End Function
+
+Private Function TestHeaderLabel() As String
+    TestHeaderLabel = "% CHG"
+End Function
+
+'------------------------------------------------------------------------------
+' v22. The plain-language verdict, rendered only under band mode. Says where
+' the row landed against its OWN normal range, without naming a statistic.
+'
+' The bands are multiples of SurgeThreshold rather than fixed sigma counts,
+' so moving the threshold moves the wording with it and "just outside" always
+' means just past wherever the line actually is.
+'
+' Returns "" under mode 1, and the callers omit the column entirely in that
+' case - there is no per-row range to describe when the test is a flat
+' percentage applied to every row alike.
+'------------------------------------------------------------------------------
+Private Function VerdictTxt(r As tRow) As String
+
+    Dim vAbs As Double
+    Dim sDir As String
+
+    If m_effTestMode <> 2 Then
+        VerdictTxt = ""
+        Exit Function
+    End If
+
+    If r.zScore = NO_PCT Then
+        VerdictTxt = "not enough history"
+        Exit Function
+    End If
+
+    vAbs = Abs(r.zScore)
+    If r.zScore >= 0 Then sDir = "above" Else sDir = "below"
+
+    If vAbs >= Z_EXTREME Then
+        VerdictTxt = "far " & sDir & " anything seen before"
+    ElseIf vAbs < m_cfg.thr Then
+        VerdictTxt = "within normal range"
+    ElseIf vAbs < m_cfg.thr * VERDICT_CLEAR Then
+        VerdictTxt = "just " & sDir & " normal range"
+    ElseIf vAbs < m_cfg.thr * VERDICT_FAR Then
+        VerdictTxt = "clearly " & sDir & " normal range"
+    Else
+        VerdictTxt = "far " & sDir & " normal range"
+    End If
+
+End Function
+
+
+Private Function VerdictCol(r As tRow) As String
+    If r.zScore = NO_PCT Then
+        VerdictCol = C_MUTED
+    ElseIf r.zScore >= 0 Then
+        VerdictCol = "#006100"
+    Else
+        VerdictCol = "#9C0006"
+    End If
+End Function
+
+'------------------------------------------------------------------------------
+' v22. How the threshold is described in running prose. Under band mode the
+' raw m_cfg.thr is a band width, so Format(thr, "0.0%") would print "200.0%"
+' and mean nothing to a reader.
+'------------------------------------------------------------------------------
+Private Function ThresholdShort() As String
+    If m_effTestMode = 2 Then
+        ThresholdShort = "outer-band"
+    Else
+        ThresholdShort = Format(m_cfg.thr, "0.0%")
+    End If
+End Function
+
+Private Function OutsideTxt() As String
+    If m_effTestMode = 2 Then
+        OutsideTxt = "outside its normal operating range"
+    Else
+        OutsideTxt = "more than " & Format(m_cfg.thr, "0.0%") & " away from its HWA"
+    End If
+End Function
+
+Private Function RankLabel() As String
+    If m_effTestMode = 2 Then
+        RankLabel = "distance outside the normal range for that row"
+    ElseIf m_cfg.sortBy = 1 Then
+        RankLabel = "VAR vs HWA (ACT &minus; HWA, in " & UNIT_VALUE & ")"
+    Else
+        RankLabel = "% CHG vs HWA"
+    End If
+End Function
+
+' The summary table labels the planned-receipts columns "Plan MML" - the name
+' the business uses for the figure.
+Private Function MMLLabel() As String
+    MMLLabel = "Plan MML"
+End Function
+
+'------------------------------------------------------------------------------
+' One table cell. nowrap keeps figures on a single line so the column can size
+' itself to its widest value.
+'------------------------------------------------------------------------------
+Private Function Cell(sTxt As String, sAlign As String, sSize As String, _
+                      sColour As String, bBold As Boolean) As String
+
+    Dim sOpen As String, sClose As String
+
+    If Len(sColour) > 0 Then
+        sOpen = "<font face='Segoe UI' size='" & sSize & "' color='" & sColour & "'>"
+    Else
+        sOpen = "<font face='Segoe UI' size='" & sSize & "'>"
+    End If
+    sClose = "</font>"
+
+    If bBold Then
+        sOpen = sOpen & "<b>"
+        sClose = "</b>" & sClose
+    End If
+
+    Cell = "<td align='" & sAlign & "' nowrap style='padding:3px 4px'>" & _
+           sOpen & sTxt & sClose & "</td>"
+End Function
+
+Private Function HeadCell(sTxt As String, sAlign As String, sBg As String) As String
+    HeadCell = "<th align='" & sAlign & "' nowrap bgcolor='" & sBg & "' style='padding:4px 4px'>" & _
+               "<font face='Segoe UI' size='2' color='#FFFFFF'>" & sTxt & "</font></th>"
+End Function
+
+Private Function BandCell(sTxt As String, nSpan As Long, sBg As String) As String
+    If nSpan <= 0 Then
+        BandCell = "<th nowrap bgcolor='" & sBg & "' style='padding:3px 4px'>&nbsp;</th>"
+    Else
+        BandCell = "<th colspan='" & nSpan & "' nowrap bgcolor='" & sBg & _
+                   "' style='padding:3px 4px'>" & _
+                   "<font face='Segoe UI' size='2' color='#FFFFFF'>" & sTxt & "</font></th>"
+    End If
+End Function
+
+'------------------------------------------------------------------------------
+' Summary header: thirteen columns in three labelled blocks, fourteen under
+' band mode where VERDICT joins the vs-HWA block. Each band carries the unit
+' its figures are in.
+'
+' One abbreviation per concept, used identically in every table and in the
+' legend: ACT, HWA, VAR, % CHG. "EXP" and "EST" are deliberately not used
+' anywhere - the expected figure is the HWA and nothing else.
+'------------------------------------------------------------------------------
+Private Function SummaryHeaderHtml() As String
+
+    Dim s As String
+
+    s = "<tr>"
+    s = s & BandCell("", 0, C_BAND) & BandCell("", 0, C_BAND)
+    s = s & BandCell("RECEIPTS vs HWA (" & UNIT_VALUE & ")", _
+                     IIf(m_effTestMode = 2, 5, 4), C_BAND)
+    s = s & BandCell("RECEIPTS vs " & UCase(MMLLabel()) & " (" & UNIT_VALUE & ")", 3, C_BAND_P)
+    s = s & BandCell("QUANTITY vs HWA (" & UNIT_QTY & ")", 4, C_BAND_Q)
+    s = s & "</tr>"
+
+    s = s & "<tr>"
+    s = s & HeadCell("#", "right", C_HEAD)
+    s = s & HeadCell("Sales group", "left", C_HEAD)
+    s = s & HeadCell(TestHeaderLabel(), "center", C_HEAD)
+    If m_effTestMode = 2 Then s = s & HeadCell("VERDICT", "left", C_HEAD)
+    s = s & HeadCell("VAR", "right", C_HEAD)
+    s = s & HeadCell("ACT", "right", C_HEAD)
+    s = s & HeadCell("HWA", "right", C_HEAD)
+    s = s & HeadCell("% CHG", "center", C_HEAD_P)
+    s = s & HeadCell("VAR", "right", C_HEAD_P)
+    s = s & HeadCell(UCase(MMLLabel()), "right", C_HEAD_P)
+    s = s & HeadCell("% CHG", "center", C_HEAD_Q)
+    s = s & HeadCell("VAR", "right", C_HEAD_Q)
+    s = s & HeadCell("ACT", "right", C_HEAD_Q)
+    s = s & HeadCell("HWA", "right", C_HEAD_Q)
+    s = s & "</tr>"
+
+    SummaryHeaderHtml = s
+End Function
+
+'------------------------------------------------------------------------------
+' Engine section header. Identical to SummaryHeaderHtml column for column -
+' same blocks, same colours, same order - with ENGINE MODEL as the label
+' instead of the sales group. Thirteen columns, fourteen under band mode.
+'------------------------------------------------------------------------------
+Private Function EngineHeaderHtml() As String
+
+    Dim s As String
+
+    s = "<tr>"
+    s = s & BandCell("", 0, C_BAND) & BandCell("", 0, C_BAND)
+    s = s & BandCell("RECEIPTS vs HWA (" & UNIT_VALUE & ")", _
+                     IIf(m_effTestMode = 2, 5, 4), C_BAND)
+    s = s & BandCell("RECEIPTS vs " & UCase(MMLLabel()) & " (" & UNIT_VALUE & ")", 3, C_BAND_P)
+    s = s & BandCell("QUANTITY vs HWA (" & UNIT_QTY & ")", 4, C_BAND_Q)
+    s = s & "</tr>"
+
+    s = s & "<tr>"
+    s = s & HeadCell("#", "right", C_HEAD)
+    s = s & HeadCell("Engine model", "left", C_HEAD)
+    s = s & HeadCell(TestHeaderLabel(), "center", C_HEAD)
+    If m_effTestMode = 2 Then s = s & HeadCell("VERDICT", "left", C_HEAD)
+    s = s & HeadCell("VAR", "right", C_HEAD)
+    s = s & HeadCell("ACT", "right", C_HEAD)
+    s = s & HeadCell("HWA", "right", C_HEAD)
+    s = s & HeadCell("% CHG", "center", C_HEAD_P)
+    s = s & HeadCell("VAR", "right", C_HEAD_P)
+    s = s & HeadCell(UCase(MMLLabel()), "right", C_HEAD_P)
+    s = s & HeadCell("% CHG", "center", C_HEAD_Q)
+    s = s & HeadCell("VAR", "right", C_HEAD_Q)
+    s = s & HeadCell("ACT", "right", C_HEAD_Q)
+    s = s & HeadCell("HWA", "right", C_HEAD_Q)
+    s = s & "</tr>"
+
+    EngineHeaderHtml = s
+End Function
+
+
+'------------------------------------------------------------------------------
+' Panel header: eight columns. ACT, HWA and the Plan MML figure are dropped
+' so two panels still fit across the width. VERDICT is not a column here
+' either - it sits on the panel title line, see GroupTitleHtml.
+'------------------------------------------------------------------------------
+Private Function PanelHeaderHtml() As String
+
+    Dim s As String
+
+    s = "<tr>"
+    s = s & BandCell("", 0, C_BAND) & BandCell("", 0, C_BAND)
+    s = s & BandCell("vs HWA (" & UNIT_VALUE & ")", 2, C_BAND)
+    s = s & BandCell("vs " & UCase(MMLLabel()) & " (" & UNIT_VALUE & ")", 2, C_BAND_P)
+    s = s & BandCell("QTY vs HWA (" & UNIT_QTY & ")", 2, C_BAND_Q)
+    s = s & "</tr>"
+
+    s = s & "<tr>"
+    s = s & HeadCell("#", "right", C_HEAD)
+    s = s & HeadCell("Customer / part type", "left", C_HEAD)
+    s = s & HeadCell(TestHeaderLabel(), "center", C_HEAD)
+    s = s & HeadCell("VAR", "right", C_HEAD)
+    s = s & HeadCell("% CHG", "center", C_HEAD_P)
+    s = s & HeadCell("VAR", "right", C_HEAD_P)
+    s = s & HeadCell("% CHG", "center", C_HEAD_Q)
+    s = s & HeadCell("VAR", "right", C_HEAD_Q)
+    s = s & "</tr>"
+
+    PanelHeaderHtml = s
+End Function
+
+'------------------------------------------------------------------------------
+' Summary row. The group name, the HWA % change and the verdict carry the
+' weight - the verdict is what explains why this row is in the table at all
+' when the numbers alone do not.
+'------------------------------------------------------------------------------
+Private Function SummaryRowHtml(r As tRow, idx As Long) As String
+
+    Dim bg As String, sVerdict As String
+
+    If idx Mod 2 = 0 Then bg = C_ROW_A Else bg = C_ROW_B
+
+    If m_effTestMode = 2 Then
+        sVerdict = Cell(VerdictTxt(r), "left", "2", VerdictCol(r), False)
+    End If
+
+    SummaryRowHtml = "<tr bgcolor='" & bg & "'>" & _
+        Cell(CStr(idx + 1), "right", "2", C_MUTED, False) & _
+        Cell(LabelHtml(r.Label, MAX_GRP_LABEL), "left", "3", "", True) & _
+        Cell(TestTxt(r), "center", "3", TestCol(r), True) & _
+        sVerdict & _
+        Cell(MoneySigned(r.gap), "right", "2", "", False) & _
+        Cell(Money(r.act), "right", "2", "", False) & _
+        Cell(Money(r.exp), "right", "2", "", False) & _
+        Cell(PaceTxt(r.planPace), "center", "3", PaceCol(r.planPace), True) & _
+        Cell(PlanGapTxt(r), "right", "2", "", False) & _
+        Cell(PlanMoney(r), "right", "2", "", False) & _
+        Cell(PaceTxt(r.qPace), "center", "2", PaceCol(r.qPace), True) & _
+        Cell(QtySigned(r.qGap), "right", "2", "", False) & _
+        Cell(Qty(r.qAct), "right", "2", "", False) & _
+        Cell(Qty(r.qExp), "right", "2", "", False) & _
+        "</tr>"
+End Function
+
+'------------------------------------------------------------------------------
+' One engine model. Identical to SummaryRowHtml, with the engine model in the
+' label cell and clipped at MAX_ENG_LABEL rather than MAX_GRP_LABEL.
+'------------------------------------------------------------------------------
+Private Function EngineRowHtml(r As tRow, idx As Long) As String
+    Dim bg As String, sVerdict As String
+
+    If idx Mod 2 = 0 Then bg = C_ROW_A Else bg = C_ROW_B
+
+    If m_effTestMode = 2 Then
+        sVerdict = Cell(VerdictTxt(r), "left", "2", VerdictCol(r), False)
+    End If
+
+    EngineRowHtml = "<tr bgcolor='" & bg & "'>" & _
+        Cell(CStr(idx + 1), "right", "2", C_MUTED, False) & _
+        Cell(LabelHtml(r.Label, MAX_ENG_LABEL), "left", "3", "", True) & _
+        Cell(TestTxt(r), "center", "3", TestCol(r), True) & _
+        sVerdict & _
+        Cell(MoneySigned(r.gap), "right", "2", "", False) & _
+        Cell(Money(r.act), "right", "2", "", False) & _
+        Cell(Money(r.exp), "right", "2", "", False) & _
+        Cell(PaceTxt(r.planPace), "center", "3", PaceCol(r.planPace), True) & _
+        Cell(PlanGapTxt(r), "right", "2", "", False) & _
+        Cell(PlanMoney(r), "right", "2", "", False) & _
+        Cell(PaceTxt(r.qPace), "center", "2", PaceCol(r.qPace), True) & _
+        Cell(QtySigned(r.qGap), "right", "2", "", False) & _
+        Cell(Qty(r.qAct), "right", "2", "", False) & _
+        Cell(Qty(r.qExp), "right", "2", "", False) & _
+        "</tr>"
+End Function
+
+
+'------------------------------------------------------------------------------
+' One breached customer / part type inside a panel: eight columns. The label
+' cell holds two lines - nowrap still honours the explicit <br> between them.
+'------------------------------------------------------------------------------
+Private Function DriverRowHtml(r As tRow, rank As Long) As String
+
+    Dim bg As String
+
+    If rank Mod 2 = 1 Then bg = "#FFFFFF" Else bg = C_ROW_B
+
+    DriverRowHtml = "<tr bgcolor='" & bg & "'>" & _
+        Cell(CStr(rank), "right", "2", C_MUTED, False) & _
+        Cell(ItemLabelHtml(r.Label), "left", "2", "", False) & _
+        Cell(TestTxt(r), "center", "2", TestCol(r), True) & _
+        Cell(MoneySigned(r.gap), "right", "2", "", False) & _
+        Cell(PaceTxt(r.planPace), "center", "2", PaceCol(r.planPace), True) & _
+        Cell(PlanGapTxt(r), "right", "2", "", False) & _
+        Cell(PaceTxt(r.qPace), "center", "2", PaceCol(r.qPace), False) & _
+        Cell(QtySigned(r.qGap), "right", "2", "", False) & _
+        "</tr>"
+End Function
+
+
+'------------------------------------------------------------------------------
+' The plant heading. Sized so PWCS and CAS read as two separate reports
+' rather than one long list.
+'------------------------------------------------------------------------------
+Private Function PlantHeadingHtml(plantNm As String, plantCd As String) As String
+
+    Dim s As String
+
+    s = "<table border='0' cellpadding='0' cellspacing='0' style='margin:2px 0 8px 0'><tr>" & _
+        "<td bgcolor='" & C_TITLE & "' nowrap style='padding:6px 14px'>" & _
+        "<font face='Segoe UI' size='4' color='#FFFFFF'><b>" & HtmlEsc(plantNm) & "</b></font>" & _
+        "<font face='Segoe UI' size='2' color='#C6D9F1'>&nbsp;&nbsp;&#183;&nbsp;&nbsp;plant " & _
+        HtmlEsc(plantCd) & "</font>" & _
+        "</td></tr></table>"
+
+    PlantHeadingHtml = s
+End Function
+
+
+'------------------------------------------------------------------------------
+' The title line that sits in the first row of a panel. Every figure on it
+' carries its unit, because this line is often read on its own. Under band
+' mode the verdict rides on this line rather than becoming a ninth column -
+' eight columns at two panels per row is already the practical maximum.
+'------------------------------------------------------------------------------
+Private Function GroupTitleHtml(grp As tRow, idx As Long) As String
+
+    Dim s As String
+    Const SEP As String = "&nbsp;&nbsp;&#183;&nbsp;&nbsp;"
+
+    s = "<font face='Segoe UI' size='3' color='#FFFFFF'><b>" & (idx + 1) & ".&nbsp;" & _
+        LabelHtml(grp.Label, MAX_GRP_LABEL) & "&nbsp;&nbsp;" & TestTxt(grp) & _
+        "&nbsp;vs HWA" & _
+        IIf(m_effTestMode = 2, SEP & VerdictTxt(grp), "") & _
+        "</b></font><br>"
+
+    s = s & "<font face='Segoe UI' size='2' color='#C6D9F1'>" & _
+            "VAR vs HWA " & MoneySigned(grp.gap) & SEP & _
+            MMLLabel() & " " & PaceTxt(grp.planPace) & " / " & PlanGapTxt(grp) & SEP & _
+            "QTY " & PaceTxt(grp.qPace) & " / " & QtySigned(grp.qGap) & " " & UNIT_QTY & SEP & _
+            grp.nSub & " breached"
+
+    s = s & "</font>"
+
+    GroupTitleHtml = s
+End Function
+
+
+'------------------------------------------------------------------------------
+' One sales group as a single self-sizing table: title row, header, then the
+' breached combinations.
+'
+' v20: a group that received nothing at all gets its own note. The generic
+' "no single part type breached" read as reassurance in exactly the case that
+' warrants the least - every part type in the group is at -100%, which is why
+' none of them was individually listed.
+'------------------------------------------------------------------------------
+Private Function GroupPanelHtml(grp As tRow, idx As Long, sDrv As String) As String
+
+    Dim s As String
+
+    s = "<table border='1' cellpadding='0' cellspacing='0' " & _
+        "style='border-collapse:collapse;border-color:" & C_BORDER & "'>"
+
+    If Len(sDrv) > 0 Then
+        s = s & "<tr bgcolor='" & C_TITLE & "'><td colspan='8' nowrap style='padding:4px 8px'>" & _
+                GroupTitleHtml(grp, idx) & "</td></tr>"
+        s = s & PanelHeaderHtml()
+        s = s & sDrv
+    Else
+        s = s & "<tr bgcolor='" & C_TITLE & "'><td nowrap style='padding:4px 8px'>" & _
+                GroupTitleHtml(grp, idx) & "</td></tr>"
+
+        If grp.act = 0 Then
+            s = s & "<tr><td nowrap style='padding:4px 8px'>" & _
+                    "<font face='Segoe UI' size='2' color='" & C_ALERT & "'><b>" & _
+                    "No receipts at all in this window.</b> Every part type in this " & _
+                    "group is at &minus;100%, so none is listed individually." & _
+                    "</font></td></tr>"
+        Else
+            s = s & "<tr><td nowrap style='padding:4px 8px'>" & _
+                    "<font face='Segoe UI' size='2' color='" & C_MUTED & "'><i>" & _
+                    "Off pace across the board - no single part type breached." & _
+                    "</i></font></td></tr>"
+        End If
+    End If
+
+    s = s & "</table>"
+
+    GroupPanelHtml = s
+End Function
+
+
+'------------------------------------------------------------------------------
+' Lay the panels out PANELS_PER_ROW to a row, top-aligned, reading left to
+' right in rank order - so the sharpest movement is top-left.
+'------------------------------------------------------------------------------
+Private Function PanelGridHtml(panel() As String, n As Long) As String
+
+    Dim s As String
+    Dim i As Long, c As Long
+
+    If n <= 0 Then Exit Function
+
+    If n = 1 Then
+        PanelGridHtml = panel(0)
+        Exit Function
+    End If
+
+    s = "<table border='0' cellpadding='0' cellspacing='0'>"
+
+    i = 0
+    Do While i < n
+        s = s & "<tr>"
+
+        For c = 0 To PANELS_PER_ROW - 1
+            s = s & "<td valign='top' style='padding:0 10px 14px 0'>"
+            If i + c < n Then s = s & panel(i + c)
+            s = s & "</td>"
+        Next c
+
+        s = s & "</tr>"
+        i = i + PANELS_PER_ROW
+    Loop
+
+    s = s & "</table>"
+
+    PanelGridHtml = s
+End Function
+
+
+'==============================================================================
+' HOW TO READ THIS EMAIL
+'   The legend, boxed, below both plant sections. Each plant section ends with
+'   a line pointing down to it, so anyone who does not recognise a column has
+'   exactly one place to look.
+'
+'   Fixed width - the only table in the email that carries one. Everything
+'   else self-sizes to its figures; this is prose, and without a width it
+'   stretches to whatever the widest panel grid made the message.
+'
+'   v22: under band mode this is where the method is explained in words. It
+'   is the only place a reader can find out why two rows with a similar
+'   % CHG did not both appear, so it should not be shortened.
+'==============================================================================
+Private Function LegendBoxHtml() As String
+
+    Dim s As String
+
+    s = "<table border='1' cellpadding='0' cellspacing='0' width='" & LEGEND_WIDTH & "' " & _
+        "style='border-collapse:collapse;border-color:" & C_BORDER & ";margin:6px 0 12px 0'>"
+
+    s = s & "<tr bgcolor='" & C_TITLE & "'><td nowrap style='padding:5px 12px'>" & _
+            "<font face='Segoe UI' size='3' color='#FFFFFF'><b>How to read this email</b></font>" & _
+            "</td></tr>"
+
+    s = s & "<tr bgcolor='#FFFFFF'><td style='padding:8px 12px'>"
+    s = s & "<font face='Segoe UI' size='2'>"
+
+    s = s & "<b>HWA</b> is the <b>historical weighted average</b> &#8212; what this row " & _
+            "would normally have received over a window this long, blending the " & _
+            "recency-weighted monthly baseline with the trailing weekly average. It is " & _
+            "the same figure the dashboard forecasts against.<br><br>"
+
+    s = s & "<b>VAR vs HWA</b> is <b>ACT</b> &minus; <b>HWA</b>, in dollars, over " & _
+            WeekSpanLabel() & " of " & Format(m_evalDate, "mmmm yyyy") & " (" & _
+            WindowRangeTxt() & "), with <b>% CHG</b> = VAR &divide; HWA."
+
+    If m_effTestMode = 2 Then
+        s = s & " Whether a row is <b>flagged</b>, though, is not judged on % CHG. " & _
+                "Each row is compared against its <b>own</b> normal week-to-week " & _
+                "range, worked out from its receipts over the last " & m_cfg.nWeeks & _
+                " weeks. The <b>VERDICT</b> column says where it landed:<br><br>" & _
+                "&nbsp;&nbsp;<b>within normal range</b> &#8212; the move is ordinary " & _
+                "for this row<br>" & _
+                "&nbsp;&nbsp;<b>just above / below normal range</b> &#8212; outside " & _
+                "its usual pattern, but not dramatically<br>" & _
+                "&nbsp;&nbsp;<b>clearly above / below normal range</b> &#8212; well " & _
+                "outside what this row normally does<br>" & _
+                "&nbsp;&nbsp;<b>far above / below normal range</b> &#8212; a long way " & _
+                "outside its usual pattern<br>" & _
+                "&nbsp;&nbsp;<b>far above / below anything seen before</b> &#8212; " & _
+                "this row had shown no variation at all until now<br>" & _
+                "&nbsp;&nbsp;<b>not enough history</b> &#8212; too few weeks of data " & _
+                "to judge<br><br>" & _
+                "This is why two rows can show a similar % CHG and only one of them " & _
+                "appear here: a row that habitually swings widely has to move further " & _
+                "before it counts as unusual, while a row that is normally steady is " & _
+                "flagged sooner. The method is set out in <b>Parameters used</b> below."
+    Else
+        s = s & " A row is flagged when % CHG clears <b>" & Format(m_cfg.thr, "0.0%") & _
+                "</b>"
+        If m_cfg.dollarFloor > 0 Then
+            s = s & ", and only then if the VAR is also at least <b>" & _
+                    Money(m_cfg.dollarFloor) & "</b>, so large percentages on small " & _
+                    "dollar values are left out"
+        End If
+        s = s & "."
+    End If
+    s = s & "<br><br>"
+
+    s = s & "<b>Summary by engine model</b> lists every <b>engine model</b> in the " & _
+            "plant that breached, pooled across all sales groups and customers. " & _
+            "It is there because an engine that goes quiet inside an otherwise " & _
+            "healthy sales group does not show up anywhere else in this email. " & _
+            "Engine model is a grain used nowhere else here, so these rows do not " & _
+            "add up to the summary table above and are not part of the breached " & _
+            "counts quoted there. Engines that received nothing at all are counted " & _
+            "under the table instead of listed, since they are all at &minus;100% " & _
+            "and cannot be ranked against each other.<br><br>"
+
+    s = s & "<b>VAR vs Plan MML</b> is month-to-date ACT &minus; <b>Plan MML</b>, the " & _
+            "planned receipts figure, in dollars. The MML is published per plant per month " & _
+            "only, so it is split down to sales group and part type using the <b>HWA " & _
+            "ratio</b> &#8212; each row's share of the plant's HWA is the share of the " & _
+            "plant's MML it is given."
+    If m_cfg.prorate = 1 Then
+        s = s & " The plan is scaled to the part of the month elapsed (" & m_weeks & _
+                " of 4 weeks), so the comparison is like-for-like."
+    Else
+        s = s & " The plan is the <i>full month</i> figure, so early in the month every " & _
+                "row reads negative by design."
+    End If
+    s = s & "<br><br>"
+
+    s = s & "<b>ACT</b> actual received (" & UNIT_VALUE & ") &nbsp;&#183;&nbsp; " & _
+            "<b>HWA</b> historical weighted average, i.e. what was expected (" & _
+            UNIT_VALUE & ") &nbsp;&#183;&nbsp; " & _
+            "<b>VAR</b> ACT &minus; HWA (" & UNIT_VALUE & ") &nbsp;&#183;&nbsp; " & _
+            "<b>% CHG</b> VAR &divide; HWA (%) &nbsp;&#183;&nbsp; "
+
+    If m_effTestMode = 2 Then
+        s = s & "<b>VERDICT</b> where this row landed against its own normal range " & _
+                "&nbsp;&#183;&nbsp; "
+    End If
+
+    s = s & "<b>Plan MML</b> this row's share of the plant's planned receipts (" & _
+            UNIT_VALUE & ") &nbsp;&#183;&nbsp; " & _
+            "<b>QTY</b> the same comparison counted in " & UNIT_QTY & " received rather " & _
+            "than dollars &nbsp;&#183;&nbsp; a dash means the denominator was zero " & _
+            "&nbsp;&#183;&nbsp; K = thousand, M = million; dollar figures are rounded " & _
+            "for width.<br><br>"
+
+    s = s & "<font color='" & C_MUTED & "'>Panel rows carry the <b>customer</b> on the " & _
+            "first line, in grey, and the <b>part type</b> beneath it. Either is " & _
+            "shortened with an ellipsis only if it is very long; the full text is " & _
+            "in the dashboard.</font>"
+
+    s = s & "</font></td></tr></table>"
+
+    LegendBoxHtml = s
+End Function
+
+
+'==============================================================================
+' PARAMETERS - deliberately small. Two name/value pairs per row at font size 1
+' with tight padding, so the whole block is a footnote rather than a section.
+'
+' v22: under band mode this block states the method in plain terms - a bell
+' curve split into six bands, the middle four normal, the outer two flagged.
+' That is the description the reader is pointed to from the legend.
+'==============================================================================
+Private Sub AddParam(ByRef nm() As String, ByRef vl() As String, ByRef n As Long, _
+                     sName As String, sVal As String)
+    nm(n) = sName
+    vl(n) = sVal
+    n = n + 1
+End Sub
+
+
+Private Function PCell(sTxt As String, bValue As Boolean) As String
+    If bValue Then
+        PCell = "<td nowrap style='padding:1px 10px 1px 3px'>" & _
+                "<font face='Segoe UI' size='1'><b>" & sTxt & "</b></font></td>"
+    Else
+        PCell = "<td nowrap style='padding:1px 4px 1px 6px'>" & _
+                "<font face='Segoe UI' size='1' color='" & C_MUTED & "'>" & sTxt & "</font></td>"
+    End If
+End Function
+
+
+Private Function ParamTableHtml() As String
+
+    Dim nm(0 To 29) As String, vl(0 To 29) As String
+    Dim n As Long, i As Long, c As Long
+    Dim s As String
+    Dim sBasis As String, sMin As String, sPlan As String, sFloor As String
+
+    If m_cfg.mode = 1 Then
+        sBasis = WeekSpanLabel() & " on its own"
+    Else
+        sBasis = WeekSpanLabel() & " cumulative, month to date"
+    End If
+
+    If m_cfg.minExp <= 0 Then
+        sMin = "none"
+    Else
+        sMin = Money(m_cfg.minExp) & " HWA or more"
+    End If
+
+    If m_cfg.dollarFloor <= 0 Then
+        sFloor = "none - any size of VAR qualifies"
+    Else
+        sFloor = "VAR of " & Money(m_cfg.dollarFloor) & " or more"
+    End If
+
+    If m_cfg.prorate = 1 Then
+        sPlan = "Plan MML scaled to " & m_weeks & "/4 of the month"
+    Else
+        sPlan = "full month Plan MML, MTD ACT"
+    End If
+
+    n = 0
+    AddParam nm, vl, n, "Period reported", Format(m_evalDate, "mmmm yyyy")
+    AddParam nm, vl, n, "HWA basis", sBasis
+    AddParam nm, vl, n, "Period covered", WindowRangeTxt()
+    AddParam nm, vl, n, "Source data as at", Format(m_refCap, "dd mmm yyyy")
+
+    ' v22: the method, in plain terms. A requested-but-unavailable band test
+    ' is called out here rather than left for the reader to wonder why the
+    ' VERDICT column is missing.
+    If m_effTestMode = 2 Then
+        AddParam nm, vl, n, "Flagging method", "bell curve, six bands"
+        AddParam nm, vl, n, "Treated as normal", "middle four bands"
+        AddParam nm, vl, n, "Flagged as anomalies", "outer two bands - one high, one low"
+        AddParam nm, vl, n, "Range measured over", m_cfg.nWeeks & " trailing weeks, per row"
+        AddParam nm, vl, n, "Judged against", "each row's own history, not a flat percentage"
+        If m_cfg.trimVol = 1 Then
+            AddParam nm, vl, n, "Range trim", "most extreme week excluded first"
+        End If
+    Else
+        AddParam nm, vl, n, "Flagging method", "percent deviation from HWA" & _
+                 IIf(m_cfg.testMode = 2, " (bell curve requested, NWeeks below minimum)", "")
+        AddParam nm, vl, n, "Threshold", Format(m_cfg.thr, "0.0%") & " away from HWA"
+    End If
+
+    AddParam nm, vl, n, "HWA baseline window", m_cfg.nMonths & " months, recency weighted"
+    AddParam nm, vl, n, "HWA recent window", m_cfg.nWeeks & " trailing weeks"
+    AddParam nm, vl, n, "Seasonal weight", Format(m_cfg.seasW, "0.00") & " toward recent"
+    AddParam nm, vl, n, "Ranked by", RankLabel()
+    AddParam nm, vl, n, "Minimum HWA", sMin
+    AddParam nm, vl, n, "Dollar floor", sFloor
+    AddParam nm, vl, n, "Rows per panel", "top " & m_cfg.topDrv & " per sales group"
+    AddParam nm, vl, n, "Engine section", "every engine model that breached, per plant"
+    AddParam nm, vl, n, "Plan MML comparison", sPlan
+    AddParam nm, vl, n, "Plan MML split", "HWA ratio, row HWA / plant HWA"
+    AddParam nm, vl, n, "Value columns", "US dollars (" & UNIT_VALUE & "), K = thousand, M = million"
+    AddParam nm, vl, n, "Quantity columns", UNIT_QTY & " received"
+    AddParam nm, vl, n, "Reporting trigger", IIf(m_cfg.trigMode = 1, _
+             "start of each bucket - 1st, 8th, 15th, 22nd", "latest receipt date")
+    AddParam nm, vl, n, "Plants", "PWCS 5610, CAS 5650 - reported separately"
+
+    s = "<table border='1' cellpadding='0' cellspacing='0' " & _
+        "style='border-collapse:collapse;border-color:" & C_BORDER & ";margin:2px 0 8px 0'>"
+
+    i = 0
+    Do While i < n
+        s = s & "<tr bgcolor='" & IIf((i \ 2) Mod 2 = 0, "#FFFFFF", C_ROW_B) & "'>"
+        For c = 0 To 1
+            If i + c < n Then
+                s = s & PCell(nm(i + c), False) & PCell(vl(i + c), True)
+            Else
+                s = s & "<td>&nbsp;</td><td>&nbsp;</td>"
+            End If
+        Next c
+        s = s & "</tr>"
+        i = i + 2
+    Loop
+
+    s = s & "</table>"
+
+    ParamTableHtml = s
+End Function
+
+
+'==============================================================================
+' BODY
+'   Link first, then the headline numbers, then PWCS, then CAS, then the
+'   legend box, then the small parameters block.
+'==============================================================================
+Private Function BodyHtml(sSections As String, nTotal As Long) As String
+
+    Dim s As String
+
+    s = "<font face='Segoe UI' size='3'>"
+    s = s & "Hello,<br><br>"
+
+    '--- the link, first thing in the message ---------------------------------
+    s = s & "<font size='4'><b><a href='" & REPORT_URL & "'>Open the " & APP_NAME & _
+            " dashboard</a></b></font>" & _
+            " <font size='2' color='" & C_MUTED & "'>for the full analysis</font><br><br>"
+
+    '--- short-data banner, only when the run went ahead on stale data --------
+    If Len(m_dataWarn) > 0 Then
+        s = s & "<table border='1' cellpadding='0' cellspacing='0' width='" & LEGEND_WIDTH & "' " & _
+                "style='border-collapse:collapse;border-color:#E36C0A;margin:0 0 12px 0'>" & _
+                "<tr bgcolor='#FDE9D9'><td style='padding:7px 12px'>" & _
+                "<font face='Segoe UI' size='2' color='#974706'>" & _
+                "<b>Source data is behind this report.</b> " & m_dataWarn & _
+                "</font></td></tr></table>"
+    End If
+
+    s = s & "The " & APP_NAME & " dashboard has detected anomalies in the receipts pace for <b>" & _
+            Format(m_evalDate, "mmmm yyyy") & "</b>, " & WeekSpanLabel() & _
+            " (covering " & WindowRangeTxt() & "). <b>" & nTotal & _
+            "</b> sales group(s) moved " & OutsideTxt() & _
+            " &#8212; measured against their <b>HWA</b>, the historical weighted " & _
+            "average, i.e. what they would normally have received over a window " & _
+            "this long &#8212; across the two plants.<br><br>"
+
+    '--- forward reference to the legend box ----------------------------------
+    s = s & "<font size='2' color='" & C_MUTED & "'>" & _
+            "Every abbreviation used below &#8212; ACT, HWA, VAR, % CHG, " & _
+            IIf(m_effTestMode = 2, "VERDICT, ", "") & "Plan MML, " & _
+            "QTY &#8212; is defined, with its unit, in <b>How to read this email</b>, at " & _
+            "the foot of this message. Dollar columns are marked (" & UNIT_VALUE & _
+            ") and quantity columns (" & UNIT_QTY & ") in the band above them.</font><br><br>"
+
+    '--- PWCS then CAS --------------------------------------------------------
+    s = s & sSections
+
+    '--- the legend, boxed, after both plants ---------------------------------
+    s = s & LegendBoxHtml()
+
+    '--- parameters, small ----------------------------------------------------
+    s = s & "<font face='Segoe UI' size='2' color='" & C_MUTED & "'><b>Parameters used</b></font><br>"
+    s = s & ParamTableHtml()
+
+    s = s & "<font size='2' color='" & C_MUTED & "'>"
+    s = s & "Automated notification - " & APP_NAME & " surge/drop alert"
+    s = s & "</font>"
+    s = s & "</font>"
+
+    BodyHtml = s
+End Function
+
+
+'------------------------------------------------------------------------------
+' One row in tbl_AlertLog. Sent=True is the once-only guard AlreadySent()
+' reads, so what goes in it decides whether a bucket can come round again:
+' True closes it, False leaves it to be retried by the next daily run.
+'
+' sExtra is free text appended to the parameter fingerprint - a deferral
+' reason, a short-data note, or why nothing was sent.
+'------------------------------------------------------------------------------
+Private Sub LogRun(db As DAO.Database, evalDate As Date, refCap As Date, _
+                   weeksDone As Long, nG As Long, bSent As Boolean, _
+                   Optional sExtra As String = "")
+
+    Dim sDetail As String
+
+    sDetail = "v22 mode=" & m_cfg.mode & " trig=" & m_cfg.trigMode & _
+              " test=" & m_cfg.testMode & "/" & m_effTestMode & _
+              " thr=" & Dec(m_cfg.thr) & " nM=" & m_cfg.nMonths & _
+              " nW=" & m_cfg.nWeeks & " w=" & Dec(m_cfg.seasW) & _
+              " prorate=" & m_cfg.prorate & " hideZero=" & m_cfg.hideZero & _
+              " trimVol=" & m_cfg.trimVol & " plants=5610,5650"
+
+    If Len(sExtra) > 0 Then sDetail = sDetail & " | " & sExtra
+
+    db.Execute "INSERT INTO tbl_AlertLog " & _
+               "(RunDate, EvalYM, EvalWeek, RefDate, GroupsFlagged, Sent, Detail) VALUES (" & _
+               "Now(), " & YMOf(evalDate) & ", " & weeksDone & ", " & SqlDate(refCap) & ", " & _
+               nG & ", " & IIf(bSent, "True", "False") & ", '" & _
+               Replace(sDetail, "'", "''") & "')", dbFailOnError
+End Sub
+
+
+'==============================================================================
+' SEND - CDO, no Outlook
+'==============================================================================
+Private Sub SendAlert(sSubject As String, sBody As String)
+
+    Dim myitem As Object
+    Dim cdoconfig As Object
+    Dim sTo As String
+
+    sTo = Trim(Nz(DLookup("Notes", "tbl_Config", "ParamName='Recipients'"), ""))
+    If Len(sTo) = 0 Then sTo = "Bhargav.Prashanth@prattwhitney.com"
+
+    Set myitem = CreateObject("CDO.Message")
+    Set cdoconfig = CreateObject("CDO.Configuration")
+
+    With cdoconfig.Fields
+        .Item("http://schemas.microsoft.com/cdo/configuration/sendusing") = 2
+        .Item("http://schemas.microsoft.com/cdo/configuration/smtpserverport") = SMTP_PORT
+        .Item("http://schemas.microsoft.com/cdo/configuration/smtpserver") = SMTP_SERVER
+        .Update
+    End With
+
+    Set myitem.Configuration = cdoconfig
+
+    myitem.From = MAIL_FROM
+    myitem.To = sTo
+    myitem.Subject = sSubject
+    myitem.HTMLBody = sBody
+    myitem.HTMLBodyPart.ContentTransferEncoding = "quoted-printable"
+    myitem.Send
+
+End Sub
+
+
+'==============================================================================
+' DIAGNOSTIC
+'   Prints the intermediate figures for one sales group so they can be checked
+'   against the dashboard cell by cell. The last two lines are the ones to
+'   compare: MTD ACT against CM MTD Actual, MTD HWA against CM MTD Expected,
+'   with the .pbix filtered to the same plant and the same group.
+'
+'   v22: the z-score is still printed HERE, deliberately. It is gone from the
+'   email because readers do not need it; it is the single most useful number
+'   for reconciling the two systems, so the diagnostic keeps it.
+'==============================================================================
+Public Sub Diag(plantCd As String, sGrp As String)
+
+    Dim sW As String, b As Long
+    Dim dA As Object, dE As Object, dMB As Object, dWB As Object
+    Dim dExpM As Object, k As Variant
+    Dim totExpM As Double, planTot As Double
+    Dim dWV As Object, dMV As Object, dETmp As Object
+    Dim dVolChk As Object, vZChk As Double, vPassChk As Boolean
+    Dim rTmp As tRow
+
+    RefreshLocal
+    LoadCfg
+    m_evalDate = DueEvalDate()
+    m_weeks = DueWeek()
+
+    sW = "PlantCd='" & plantCd & "' AND SalesGrp='" & Esc(sGrp) & "'"
+
+    Debug.Print String(58, "=")
+    Debug.Print "DIAG  "; plantCd; " / "; sGrp
+    Debug.Print String(58, "=")
+    Debug.Print "today      "; Format(Date, "dd mmm yyyy"); "  trig="; m_cfg.trigMode; _
+                " mode="; m_cfg.mode; " prorate="; m_cfg.prorate
+    Debug.Print "data to    "; Format(RefDateGlobal(), "dd mmm yyyy")
+    Debug.Print "bucket due "; Format(m_evalDate, "mmm yyyy"); "  week="; m_weeks
+    Debug.Print "window     "; Format(WindowStart(m_evalDate, m_weeks), "dd mmm"); " to "; _
+                Format(WindowEnd(m_evalDate, m_weeks), "dd mmm yyyy")
+    Debug.Print "lag state  "; DataLagState(m_evalDate, m_weeks)
+    Debug.Print "rows       "; DCount("*", LOCAL_TBL, sW)
+    Debug.Print
+
+    Set dMB = MonthBasisMap(FLD_VALUE, "SalesGrp", sW, m_evalDate, m_cfg.nMonths)
+    Debug.Print "month base "; Format(ValOrZero(dMB, sGrp), "#,##0.00"); _
+                "   (per week, already /4)"
+
+    For b = 1 To m_weeks
+        Set dWB = WeekBasisMap(FLD_VALUE, "SalesGrp", sW, m_evalDate, b, m_cfg.nWeeks)
+        Debug.Print "week base "; b; " "; Format(ValOrZero(dWB, sGrp), "#,##0.00")
+    Next b
+    Debug.Print
+
+    '--- v21: the range this row is judged against ----------------------------
+    If m_effTestMode = 2 Then
+        Set dETmp = ExpMap(FLD_VALUE, "SalesGrp", sW, 2)   ' key set is just {sGrp}
+
+        For b = 1 To m_weeks
+            Set dWV = WeekVolatilityMap(FLD_VALUE, "SalesGrp", sW, m_evalDate, b, m_cfg.nWeeks, dETmp)
+            Debug.Print "week sigma "; b; " "; Format(ValOrZero(dWV, sGrp), "#,##0.00")
+        Next b
+
+        Set dMV = MTDVolatilityMap(FLD_VALUE, "SalesGrp", sW, m_evalDate, m_weeks, m_cfg.nWeeks, dETmp)
+        Debug.Print "MTD sigma  "; Format(ValOrZero(dMV, sGrp), "#,##0.00"); _
+                    "   <- CM MTD Volatility"
+        Debug.Print "trim       "; IIf(m_cfg.trimVol = 1, "on", "off")
+        Debug.Print
+    ElseIf m_cfg.testMode = 2 Then
+        Debug.Print "band test requested but NWeeks (" & m_cfg.nWeeks & _
+                     ") is below the minimum (" & MIN_VOL_WEEKS & ") - fell back to percent-vs-HWA"
+        Debug.Print
+    End If
+
+    '--- the plan denominator, exactly as PlantSectionHtml computes it ---------
+    Set dExpM = ExpMap(FLD_VALUE, "SalesGrp", "PlantCd='" & plantCd & "'", 2)
+    totExpM = 0
+    For Each k In dExpM.Keys
+        If dExpM(k) > 0 Then totExpM = totExpM + dExpM(k)
+    Next k
+    planTot = PlanTotal(plantCd)
+
+    Set dA = ActMap(FLD_VALUE, "SalesGrp", sW, 2)
+    Set dE = ExpMap(FLD_VALUE, "SalesGrp", sW, 2)
+
+    Debug.Print "--- compare these to the dashboard ---"
+    Debug.Print "MTD ACT    "; Format(ValOrZero(dA, sGrp), "#,##0.00"); _
+                "   <- CM MTD Actual"
+    Debug.Print "MTD HWA    "; Format(ValOrZero(dE, sGrp), "#,##0.00"); _
+                "   <- CM MTD Expected"
+    Debug.Print "plant HWA  "; Format(totExpM, "#,##0.00"); _
+                "   <- the REMOVEFILTERS denominator"
+    Debug.Print "plant plan "; Format(planTot, "#,##0.00"); _
+                "   <- CM Plan Month Total"
+
+    If m_effTestMode = 2 Then
+        Set dVolChk = VolMap(FLD_VALUE, "SalesGrp", "PlantCd='" & plantCd & "'", dE)
+        vPassChk = SurgeTest(ValOrZero(dA, sGrp), ValOrZero(dE, sGrp), dVolChk, sGrp, vZChk)
+        Debug.Print "z-score    "; Format(vZChk, "+0.00;-0.00"); _
+                    "   <- CM MTD Z-Score  (flag: "; IIf(vPassChk, "YES", "no"); ")"
+
+        ' What the email would actually print for this row, in words.
+        rTmp.zScore = vZChk
+        Debug.Print "verdict    "; VerdictTxt(rTmp)
+    End If
+
+    If totExpM > 0 And planTot > 0 Then
+        Debug.Print "row plan   "; _
+            Format(ValOrZero(dExpM, sGrp) / totExpM * planTot, "#,##0.00"); _
+            "   <- MTD Planned Receipts (EST ratio)"
+    Else
+        Debug.Print "row plan   -   (no plan for this plant/month)"
+    End If
+
+    Debug.Print String(58, "=")
+
+End Sub
+
+
